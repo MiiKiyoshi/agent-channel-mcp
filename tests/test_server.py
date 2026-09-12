@@ -122,8 +122,8 @@ def test_instructions_lead_from_join_to_waiter_command(tmp_path):
         assert "takes ownership" in instructions
         assert "shortest clear role name" in instructions
         assert "omit to to broadcast" in instructions
-        for kept in ("500 characters", "'id sender'",
-                     "no user authorization", "Reply only when needed"):
+        for kept in ("500 characters", "'id sender'", "explicitly delegated",
+                     "does not expand authorization", "Reply only when needed"):
             assert kept in instructions
         joined = channel.join("room", "claude")
         assert joined["next"].startswith("If waiter is missing, start command exactly once")
