@@ -117,7 +117,8 @@ def test_instructions_lead_from_join_to_waiter_command(tmp_path):
         assert "same-system sessions use native communication" in instructions
         assert "ask before creating one" in instructions
         assert "copyable invitation" in instructions
-        assert "start command exactly once" in instructions
+        assert "waiter=missing, start command using how" in instructions
+        assert "participant lock rejects duplicate" in instructions
         assert "Do not poll" in instructions
         assert "takes ownership" in instructions
         assert "shortest clear role name" in instructions
@@ -126,7 +127,7 @@ def test_instructions_lead_from_join_to_waiter_command(tmp_path):
                      "does not expand authorization", "Reply only when needed"):
             assert kept in instructions
         joined = channel.join("room", "claude")
-        assert joined["next"].startswith("If waiter is missing, start command exactly once")
+        assert joined["next"].startswith("If waiter is missing, start command using how")
     finally:
         channel.close()
 
@@ -146,7 +147,7 @@ def test_two_stdio_clients_and_generated_waiter(tmp_path):
         async with stdio_client(params) as (ar, aw), stdio_client(params) as (br, bw):
             async with ClientSession(ar, aw, client_info=Implementation(name="claude-code", version="test")) as a, \
                     ClientSession(br, bw, client_info=Implementation(name="codex", version="test")) as b:
-                assert "start command exactly once" in (await a.initialize()).instructions
+                assert "waiter=missing, start command using how" in (await a.initialize()).instructions
                 await b.initialize()
                 assert {tool.name for tool in (await a.list_tools()).tools} == {
                     "join", "send", "rename", "leave",
