@@ -81,8 +81,10 @@ class Channel:
             how = "Monitor(command=<command>, persistent=true, timeout_ms=3600000); then end the turn."
         elif "codex" in name:
             command += ' --codex "${CODEX_THREAD_ID:?CODEX_THREAD_ID is required}"'
-            how = ("Run command with exec_command(yield_time_ms=1000), then end the turn. "
-                   "Requires codex queue; do not poll.")
+            how = ('Run command with exec_command(yield_time_ms=1000, '
+                   'sandbox_permissions="require_escalated", '
+                   'justification="Allow the channel waiter to deliver messages to this Codex thread?"), '
+                   'then end the turn. Requires codex queue; do not poll.')
         else:
             how = ("Run command and read stdout. Keep the turn active unless your client "
                    "supports waking on output.")

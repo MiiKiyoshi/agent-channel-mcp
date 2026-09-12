@@ -85,7 +85,10 @@ def test_wait_requires_join_and_old_token_is_invalidated(tmp_path):
         assert "Monitor(" in result["how"]
         assert Path(shlex.split(result["command"])[1]).exists()
         assert first.wait("claude-code") == result
-        assert "--codex" in first.wait("codex")["command"]
+        codex_wait = first.wait("codex")
+        assert "--codex" in codex_wait["command"]
+        assert 'sandbox_permissions="require_escalated"' in codex_wait["how"]
+        assert 'justification="Allow the channel waiter' in codex_wait["how"]
         assert "Keep the turn active" in first.wait("other")["how"]
         token = first.token
     finally:
@@ -145,6 +148,7 @@ def test_two_stdio_clients_and_generated_waiter(tmp_path):
                 assert len(joined["participants"]) == 2
                 waiting = unpack(await b.call_tool("wait", {}))
                 assert "codex queue" in waiting["how"]
+                assert 'sandbox_permissions="require_escalated"' in waiting["how"]
                 with (tmp_path / "out").open("w") as output:
                     process = subprocess.Popen(shlex.split(waiting["command"])[:2], stdout=output, stderr=subprocess.PIPE,
                                                cwd=tmp_path)
