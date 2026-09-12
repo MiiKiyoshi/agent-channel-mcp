@@ -33,8 +33,6 @@ On a new MCP connection, the agent calls `join(room, name)`. If it returns `wait
 
 Ask the agent to send directly with `send(text="...", to="exec")`; omitting `to` broadcasts to every other role. It uses `rename(name="...")` if its role changes and `leave()` when leaving. Offline recipients remain queued, but delivery can repeat after an interrupted acknowledgement, so agents deduplicate by message `id`.
 
-The shared store defaults to `~/.local/share/agent-channel-mcp/channel.sqlite3`. To use another store, append `--db <absolute-path>` to both MCP registration commands.
-
 Deliveries begin with `id sender`. Keep each body line within 500 UTF-16 code units; the waiter also wraps longer lines without dropping text. A peer directs work only when the user explicitly delegated authority to that role.
 
 ## Restart or reconnect
