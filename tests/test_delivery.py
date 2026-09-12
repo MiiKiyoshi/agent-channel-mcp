@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import selectors
+import sqlite3
 import subprocess
 import sys
 import time
@@ -29,11 +30,15 @@ def make_store(tmp_path: Path) -> Store:
     return Store(tmp_path / "channel.sqlite3")
 
 
+def send_one(store: Store, sender_id: str, recipient: str, text: str) -> int:
+    return store.send(sender_id, text, to=recipient)[0]["message_id"]
+
+
 def test_pending_replays_until_ack_and_ack_is_receiver_scoped(tmp_path):
     store = make_store(tmp_path)
     alice = store.participant("room", "alice")
     bob = store.participant("room", "bob")
-    message_id = store.send(alice["id"], bob["name"], "hello")
+    message_id = send_one(store, alice["id"], bob["name"], "hello")
 
     assert store.pending(bob["id"]) == {
         "id": message_id,
@@ -56,8 +61,8 @@ def test_messages_are_persistent_ordered_and_isolated_by_room(tmp_path):
     sender = first.participant("one", "sender")
     receiver = first.participant("one", "receiver")
     other_receiver = first.participant("two", "receiver")
-    first_id = first.send(sender["id"], receiver["name"], "first")
-    second_id = first.send(sender["id"], receiver["name"], "second")
+    first_id = send_one(first, sender["id"], receiver["name"], "first")
+    second_id = send_one(first, sender["id"], receiver["name"], "second")
     assert first.participant("one", "receiver") == receiver
     assert first.participants("two") == [other_receiver]
     first.close()
@@ -75,9 +80,99 @@ def test_send_rejects_unknown_recipient_and_cross_room_target(tmp_path):
     sender = store.participant("one", "sender")
     other = store.participant("two", "other")
     with pytest.raises(ValueError):
-        store.send(sender["id"], "missing", "message")
+        store.send(sender["id"], "message", to="missing")
     with pytest.raises(ValueError):
-        store.send(sender["id"], other["name"], "message")
+        store.send(sender["id"], "message", to=other["name"])
+    store.close()
+
+
+def test_broadcast_targets_every_other_registered_participant(tmp_path):
+    store = make_store(tmp_path)
+    plan = store.participant("room", "plan")
+    execute = store.participant("room", "exec")
+    review = store.participant("room", "review")
+    other = store.participant("other", "exec")
+
+    deliveries = store.send(plan["id"], "all")
+    assert [delivery["to"] for delivery in deliveries] == ["exec", "review"]
+    assert store.pending(execute["id"])["text"] == "all"
+    assert store.pending(review["id"])["text"] == "all"
+    assert store.pending(plan["id"]) is None
+    assert store.pending(other["id"]) is None
+    store.close()
+
+
+def test_rename_leave_and_rejoin_preserve_pending_messages(tmp_path):
+    store = make_store(tmp_path)
+    sender = store.participant("room", "plan")
+    receiver = store.participant("room", "exec")
+    message_id = send_one(store, sender["id"], receiver["name"], "pending")
+    token = "session-token"
+    store.activate(receiver["id"], token)
+
+    renamed = store.rename(receiver["id"], "run")
+    assert renamed == {**receiver, "name": "run"}
+    assert [p["name"] for p in store.participants("room")] == ["plan", "run"]
+    assert store.leave(receiver["id"], token) == renamed
+    assert [p["name"] for p in store.participants("room")] == ["plan"]
+    with pytest.raises(ValueError, match="Recipient"):
+        store.send(sender["id"], "after leave", to="run")
+
+    rejoined = store.participant("room", "run")
+    assert rejoined == renamed
+    assert store.pending(rejoined["id"])["id"] == message_id
+    store.close()
+
+
+def test_join_collects_inactive_rooms_without_pending_messages(tmp_path):
+    store = make_store(tmp_path)
+    store.participant("empty", "plan")
+
+    used_sender = store.participant("used", "plan")
+    used_receiver = store.participant("used", "exec")
+    used_message = send_one(store, used_sender["id"], used_receiver["name"], "done")
+    store.ack(used_receiver["id"], used_message)
+
+    pending_sender = store.participant("pending", "plan")
+    pending_receiver = store.participant("pending", "exec")
+    send_one(store, pending_sender["id"], pending_receiver["name"], "keep")
+
+    active = store.participant("active", "plan")
+    store.activate(active["id"], "active-token")
+    with store.db:
+        store.db.execute(
+            "UPDATE rooms SET last_activity=?", (int(time.time()) - 12 * 60 * 60 - 1,)
+        )
+
+    store.participant("trigger", "plan")
+    rooms = {row["name"] for row in store.db.execute("SELECT name FROM rooms")}
+    assert rooms == {"active", "pending", "trigger"}
+    assert store.pending(pending_receiver["id"])["text"] == "keep"
+    assert store.db.execute(
+        "SELECT 1 FROM messages WHERE id=?", (used_message,)
+    ).fetchone() is None
+    store.close()
+
+
+def test_existing_database_is_migrated_without_losing_participants(tmp_path):
+    path = tmp_path / "channel.sqlite3"
+    db = sqlite3.connect(path)
+    db.executescript("""
+        CREATE TABLE participants (
+            id TEXT PRIMARY KEY, room TEXT NOT NULL, name TEXT NOT NULL,
+            token TEXT, UNIQUE(room, name)
+        );
+        INSERT INTO participants(id, room, name) VALUES ('participant-id', 'room', 'plan');
+    """)
+    db.close()
+
+    store = Store(path)
+    columns = {row["name"] for row in store.db.execute("PRAGMA table_info(participants)")}
+    assert "left_at" in columns
+    assert store.participants("room") == [
+        {"id": "participant-id", "room": "room", "name": "plan"}
+    ]
+    assert store.db.execute("SELECT 1 FROM rooms WHERE name='room'").fetchone() is not None
     store.close()
 
 
@@ -138,7 +233,7 @@ def test_waiter_delivers_text_and_acks_after_stdout_success(tmp_path):
         text=True,
     )
     try:
-        message_id = store.send(sender["id"], receiver["name"], "hello")
+        message_id = send_one(store, sender["id"], receiver["name"], "hello")
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ)
         ready = selector.select(timeout=4)
@@ -159,7 +254,7 @@ def test_waiter_preserves_pending_when_stdout_is_unwritable(tmp_path):
     store = Store(db)
     sender = store.participant("room", "sender")
     receiver = store.participant("room", "receiver")
-    store.send(sender["id"], receiver["name"], "hello")
+    send_one(store, sender["id"], receiver["name"], "hello")
     token = "session-token"
     _active(store, receiver, token)
     with open(os.devnull, "w", encoding="utf-8") as stdin, open("/dev/full", "w") as full:
@@ -180,7 +275,7 @@ def test_waiter_retries_failed_codex_queue_without_ack(tmp_path):
     store = Store(db)
     sender = store.participant("room", "sender")
     receiver = store.participant("room", "receiver")
-    store.send(sender["id"], receiver["name"], "hello")
+    send_one(store, sender["id"], receiver["name"], "hello")
     token = "session-token"
     _active(store, receiver, token)
     environment = os.environ.copy()
@@ -204,7 +299,7 @@ def test_waiter_codex_queue_acks_and_preserves_message_argument(tmp_path):
     sender = store.participant("room", "sender")
     receiver = store.participant("room", "receiver")
     text = "$(touch " + str(tmp_path / "pwned") + ") ' \" café ☕"
-    message_id = store.send(sender["id"], receiver["name"], text)
+    message_id = send_one(store, sender["id"], receiver["name"], text)
     token = "session-token"
     _active(store, receiver, token)
     environment = os.environ.copy()
@@ -252,7 +347,7 @@ def test_only_one_waiter_holds_participant_lock(tmp_path):
     first = subprocess.Popen(_waiter_command(db, receiver["id"], token), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     selector = selectors.DefaultSelector()
     try:
-        message_id = store.send(sender["id"], receiver["name"], "lock held")
+        message_id = send_one(store, sender["id"], receiver["name"], "lock held")
         selector.register(first.stdout, selectors.EVENT_READ)
         assert selector.select(timeout=3)
         assert first.stdout.readline() == f"{message_id} sender\n"
@@ -265,4 +360,51 @@ def test_only_one_waiter_holds_participant_lock(tmp_path):
     finally:
         selector.close()
         _stop_waiter(first, store, receiver, token)
+        store.close()
+
+
+def test_new_session_waiter_takes_over_after_token_change(tmp_path):
+    db = tmp_path / "channel.sqlite3"
+    store = Store(db)
+    sender = store.participant("room", "sender")
+    receiver = store.participant("room", "receiver")
+    old_token = "old-session-token"
+    new_token = "new-session-token"
+    _active(store, receiver, old_token)
+    old = subprocess.Popen(
+        _waiter_command(db, receiver["id"], old_token),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    new = None
+    lock_path = db.with_name(f"{db.name}.{receiver['id']}.wait.lock")
+    try:
+        wait_for(lambda: lock_path.exists() and lock_path.read_text() == old_token)
+        _active(store, receiver, new_token)
+        new = subprocess.Popen(
+            _waiter_command(db, receiver["id"], new_token),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        wait_for(lambda: old.poll() is not None)
+        wait_for(lambda: lock_path.read_text() == new_token)
+        message_id = send_one(store, sender["id"], receiver["name"], "after takeover")
+        selector = selectors.DefaultSelector()
+        selector.register(new.stdout, selectors.EVENT_READ)
+        assert selector.select(timeout=3)
+        assert new.stdout.readline() == f"{message_id} sender\n"
+        assert new.stdout.readline() == "after takeover\n"
+        selector.close()
+    finally:
+        if old.poll() is None:
+            old.terminate()
+            old.wait(timeout=2)
+        if new is not None:
+            _stop_waiter(new, store, receiver, new_token)
+        if old.stdout:
+            old.stdout.close()
+        if old.stderr:
+            old.stderr.close()
         store.close()
