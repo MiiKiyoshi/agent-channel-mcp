@@ -1,6 +1,10 @@
 import sqlite3
+import time
 import uuid
 from pathlib import Path
+
+
+ROOM_TTL_SECONDS = 12 * 60 * 60
 
 
 class Store:
@@ -11,28 +15,85 @@ class Store:
         self.path.chmod(0o600)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys = ON")
-        self.db.executescript("""
-            CREATE TABLE IF NOT EXISTS participants (
-                id TEXT PRIMARY KEY, room TEXT NOT NULL, name TEXT NOT NULL,
-                token TEXT, UNIQUE(room, name)
-            );
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sender_id TEXT NOT NULL REFERENCES participants(id),
-                recipient_id TEXT NOT NULL REFERENCES participants(id),
-                text TEXT NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS inbox
-                ON messages(recipient_id, acknowledged, id);
-        """)
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS rooms "
+                "(name TEXT PRIMARY KEY, last_activity INTEGER NOT NULL)"
+            )
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS participants ("
+                "id TEXT PRIMARY KEY, room TEXT NOT NULL, name TEXT NOT NULL, "
+                "token TEXT, left_at INTEGER, UNIQUE(room, name))"
+            )
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS messages ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "sender_id TEXT NOT NULL REFERENCES participants(id), "
+                "recipient_id TEXT NOT NULL REFERENCES participants(id), "
+                "text TEXT NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS inbox "
+                "ON messages(recipient_id, acknowledged, id)"
+            )
+            columns = {
+                row["name"] for row in self.db.execute("PRAGMA table_info(participants)")
+            }
+            if "left_at" not in columns:
+                self.db.execute("ALTER TABLE participants ADD COLUMN left_at INTEGER")
+            self.db.execute(
+                "INSERT OR IGNORE INTO rooms(name, last_activity) "
+                "SELECT DISTINCT room, ? FROM participants", (int(time.time()),)
+            )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            self.db.close()
+            raise
+
+    def _touch(self, room: str, now: int) -> None:
+        self.db.execute(
+            "INSERT INTO rooms(name, last_activity) VALUES (?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET last_activity=excluded.last_activity",
+            (room, now),
+        )
+
+    def _collect_garbage(self, now: int) -> list[str]:
+        cutoff = now - ROOM_TTL_SECONDS
+        rooms = [row["name"] for row in self.db.execute(
+            "SELECT r.name FROM rooms r WHERE r.last_activity<=? "
+            "AND NOT EXISTS (SELECT 1 FROM participants p WHERE p.room=r.name AND p.token IS NOT NULL) "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM messages m JOIN participants p ON p.id=m.recipient_id "
+            "  WHERE p.room=r.name AND m.acknowledged=0"
+            ") ORDER BY r.name",
+            (cutoff,),
+        )]
+        for room in rooms:
+            self.db.execute(
+                "DELETE FROM messages WHERE sender_id IN "
+                "(SELECT id FROM participants WHERE room=?) OR recipient_id IN "
+                "(SELECT id FROM participants WHERE room=?)",
+                (room, room),
+            )
+            self.db.execute("DELETE FROM participants WHERE room=?", (room,))
+            self.db.execute("DELETE FROM rooms WHERE name=?", (room,))
+        return rooms
 
     def participant(self, room: str, name: str) -> dict:
         if not room.strip() or not name.strip():
             raise ValueError("room and name must not be blank")
+        now = int(time.time())
         with self.db:
+            self._collect_garbage(now)
+            self._touch(room, now)
             self.db.execute(
-                "INSERT INTO participants(id, room, name) VALUES (?, ?, ?) "
+                "INSERT INTO participants(id, room, name, left_at) VALUES (?, ?, ?, NULL) "
                 "ON CONFLICT(room, name) DO NOTHING", (uuid.uuid4().hex, room, name)
+            )
+            self.db.execute(
+                "UPDATE participants SET left_at=NULL WHERE room=? AND name=?", (room, name)
             )
         return dict(self.db.execute(
             "SELECT id, room, name FROM participants WHERE room=? AND name=?", (room, name)
@@ -40,25 +101,76 @@ class Store:
 
     def participants(self, room: str) -> list[dict]:
         return [dict(row) for row in self.db.execute(
-            "SELECT id, room, name FROM participants WHERE room=? ORDER BY name", (room,)
+            "SELECT id, room, name FROM participants "
+            "WHERE room=? AND left_at IS NULL ORDER BY name", (room,)
         )]
 
-    def send(self, sender_id: str, to: str, text: str) -> int:
+    def send(self, sender_id: str, text: str, to: str | None = None) -> list[dict]:
         if not text.strip():
             raise ValueError("text must not be blank")
+        now = int(time.time())
         with self.db:
-            target = self.db.execute(
-                "SELECT recipient.id FROM participants sender JOIN participants recipient "
-                "ON sender.room=recipient.room WHERE sender.id=? AND recipient.name=?",
-                (sender_id, to)
+            sender = self.db.execute(
+                "SELECT room FROM participants WHERE id=? AND left_at IS NULL", (sender_id,)
             ).fetchone()
-            if target is None:
-                raise ValueError("Recipient has not joined this room; call join() again to refresh participants")
-            cursor = self.db.execute(
-                "INSERT INTO messages(sender_id, recipient_id, text) VALUES (?, ?, ?)",
-                (sender_id, target["id"], text)
+            if sender is None:
+                raise ValueError("Sender has left the room")
+            if to is None:
+                recipients = self.db.execute(
+                    "SELECT id, name FROM participants WHERE room=? AND id<>? "
+                    "AND left_at IS NULL ORDER BY name", (sender["room"], sender_id)
+                ).fetchall()
+            else:
+                recipients = self.db.execute(
+                    "SELECT id, name FROM participants WHERE room=? AND name=? "
+                    "AND left_at IS NULL", (sender["room"], to)
+                ).fetchall()
+                if not recipients:
+                    raise ValueError("Recipient has not joined this room; call join() again to refresh participants")
+            deliveries = []
+            for recipient in recipients:
+                cursor = self.db.execute(
+                    "INSERT INTO messages(sender_id, recipient_id, text) VALUES (?, ?, ?)",
+                    (sender_id, recipient["id"], text),
+                )
+                deliveries.append({"to": recipient["name"], "message_id": cursor.lastrowid})
+            self._touch(sender["room"], now)
+            return deliveries
+
+    def rename(self, participant_id: str, name: str) -> dict:
+        if not name.strip():
+            raise ValueError("name must not be blank")
+        now = int(time.time())
+        try:
+            with self.db:
+                participant = self.db.execute(
+                    "SELECT room FROM participants WHERE id=? AND left_at IS NULL", (participant_id,)
+                ).fetchone()
+                if participant is None:
+                    raise ValueError("Participant has left the room")
+                self.db.execute("UPDATE participants SET name=? WHERE id=?", (name, participant_id))
+                self._touch(participant["room"], now)
+        except sqlite3.IntegrityError:
+            raise ValueError("That name is already in use in this room") from None
+        return dict(self.db.execute(
+            "SELECT id, room, name FROM participants WHERE id=?", (participant_id,)
+        ).fetchone())
+
+    def leave(self, participant_id: str, token: str) -> dict:
+        now = int(time.time())
+        with self.db:
+            participant = self.db.execute(
+                "SELECT id, room, name FROM participants "
+                "WHERE id=? AND token=? AND left_at IS NULL", (participant_id, token)
+            ).fetchone()
+            if participant is None:
+                raise ValueError("This MCP session no longer owns its identity")
+            self.db.execute(
+                "UPDATE participants SET token=NULL, left_at=? WHERE id=? AND token=?",
+                (now, participant_id, token),
             )
-            return cursor.lastrowid
+            self._touch(participant["room"], now)
+        return dict(participant)
 
     def pending(self, participant_id: str) -> dict | None:
         row = self.db.execute(
@@ -79,7 +191,10 @@ class Store:
 
     def activate(self, participant_id: str, token: str) -> None:
         with self.db:
-            self.db.execute("UPDATE participants SET token=? WHERE id=?", (token, participant_id))
+            self.db.execute(
+                "UPDATE participants SET token=? WHERE id=? AND left_at IS NULL",
+                (token, participant_id),
+            )
 
     def deactivate(self, participant_id: str, token: str) -> None:
         with self.db:
@@ -89,7 +204,8 @@ class Store:
 
     def is_active(self, participant_id: str, token: str) -> bool:
         return self.db.execute(
-            "SELECT 1 FROM participants WHERE id=? AND token=?", (participant_id, token)
+            "SELECT 1 FROM participants WHERE id=? AND token=? AND left_at IS NULL",
+            (participant_id, token),
         ).fetchone() is not None
 
     def close(self) -> None:

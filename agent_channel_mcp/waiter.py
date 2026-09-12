@@ -11,13 +11,25 @@ from pathlib import Path
 from .store import Store
 
 
-def lock(path: Path):
-    handle = path.open("a")
-    try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        handle.close()
-        raise ValueError(f"Already running: {path.name}") from None
+def lock(path: Path, owner: str | None = None, takeover_timeout: float = 0):
+    handle = path.open("a+")
+    deadline = time.monotonic() + takeover_timeout
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            handle.seek(0)
+            current_owner = handle.read().strip()
+            if owner is None or current_owner == owner or time.monotonic() >= deadline:
+                handle.close()
+                raise ValueError(f"Already running: {path.name}") from None
+            time.sleep(0.05)
+    if owner is not None:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(owner)
+        handle.flush()
     return handle
 
 
@@ -46,7 +58,8 @@ def run(db: Path, participant_id: str, codex_thread: str | None = None,
             raise ValueError("codex must be on PATH")
     store = Store(db)
     try:
-        with lock(store.path.with_name(f"{store.path.name}.{participant_id}.wait.lock")):
+        with lock(store.path.with_name(f"{store.path.name}.{participant_id}.wait.lock"),
+                  owner=token, takeover_timeout=10 if token is not None else 0):
             while token is None or store.is_active(participant_id, token):
                 message = store.pending(participant_id)
                 if message is None:

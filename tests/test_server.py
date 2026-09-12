@@ -14,22 +14,65 @@ import pytest
 from agent_channel_mcp.server import Channel, create_server
 
 
-def test_identity_lock_and_reconnection(tmp_path):
+def test_identity_takeover_invalidates_old_session(tmp_path):
     path = tmp_path / "db"
     first, second = Channel(path), Channel(path)
     try:
         identity = first.join("room", "claude")["participant"]
-        with pytest.raises(ValueError, match="Already running"):
-            second.join("room", "claude")
+        joined = second.join("room", "claude")
+        assert joined["participant"] == identity
+        assert not first.store.is_active(identity["id"], first.token)
+        assert second.store.is_active(identity["id"], second.token)
+        with pytest.raises(ValueError, match="no longer owns"):
+            first.join("room", "claude")
+        with pytest.raises(ValueError, match="no longer owns"):
+            first.send("stale", to="claude")
+        with pytest.raises(ValueError, match="no longer owns"):
+            first.wait("codex")
         with pytest.raises(ValueError, match="already joined"):
             first.join("other", "claude")
         first.close()
         first = None
-        assert second.join("room", "claude")["participant"] == identity
+        assert second.store.is_active(identity["id"], second.token)
     finally:
         if first is not None:
             first.close()
         second.close()
+
+
+def test_broadcast_rename_leave_and_rejoin(tmp_path):
+    path = tmp_path / "db"
+    plan, execute, review = Channel(path), Channel(path), Channel(path)
+    try:
+        plan.join("room", "plan")
+        execute_identity = execute.join("room", "exec")["participant"]
+        review.join("room", "review")
+
+        directed = plan.send("one", to="exec")
+        assert [delivery["to"] for delivery in directed["deliveries"]] == ["exec"]
+        broadcast = plan.send("all")
+        assert [delivery["to"] for delivery in broadcast["deliveries"]] == ["exec", "review"]
+
+        renamed = execute.rename("run")
+        assert renamed["participant"] == {**execute_identity, "name": "run"}
+        assert renamed["participants"] == ["plan", "review", "run"]
+        with pytest.raises(ValueError, match="Recipient"):
+            plan.send("old name", to="exec")
+        assert plan.send("new name", to="run")["deliveries"][0]["to"] == "run"
+        with pytest.raises(ValueError, match="already in use"):
+            execute.rename("plan")
+
+        old_token = review.token
+        assert review.leave()["left"]["name"] == "review"
+        assert [p["name"] for p in plan.store.participants("room")] == ["plan", "run"]
+        with pytest.raises(ValueError, match="join"):
+            review.wait("codex")
+        assert review.join("other", "review")["participant"]["room"] == "other"
+        assert review.token != old_token
+    finally:
+        plan.close()
+        execute.close()
+        review.close()
 
 
 def test_wait_requires_join_and_old_token_is_invalidated(tmp_path):
@@ -60,13 +103,16 @@ def test_instructions_lead_from_join_to_wait(tmp_path):
     channel = Channel(tmp_path / "db")
     try:
         instructions = create_server(channel).instructions
-        assert "only between different session systems" in instructions
+        assert "only across different session systems" in instructions
         assert "same-system sessions use native communication" in instructions
         assert "ask before creating one" in instructions
-        assert "After approval, create or join it and show" in instructions
-        assert "then call wait() and start its returned command exactly once" in instructions
-        for kept in ("unique name", "registered name", "500 characters", "'id sender'",
-                     "do not add user authorization", "Reply only when needed"):
+        assert "copyable invitation" in instructions
+        assert "start its returned command exactly once" in instructions
+        assert "takes ownership" in instructions
+        assert "shortest clear role name" in instructions
+        assert "omit to to broadcast" in instructions
+        for kept in ("500 characters", "'id sender'",
+                     "no user authorization", "Reply only when needed"):
             assert kept in instructions
         assert channel.join("room", "claude")["next"].startswith("wait() and start its command once;")
     finally:
@@ -81,8 +127,8 @@ def unpack(result):
 def test_two_stdio_clients_and_generated_waiter(tmp_path):
     async def scenario():
         params = StdioServerParameters(
-            command=sys.executable,
-            args=["-m", "agent_channel_mcp.server", "--db", str(tmp_path / "db")],
+            command=str(Path(sys.executable).with_name("agent-channel-mcp")),
+            args=["--db", str(tmp_path / "db")],
             env=dict(os.environ),
         )
         async with stdio_client(params) as (ar, aw), stdio_client(params) as (br, bw):
@@ -90,7 +136,9 @@ def test_two_stdio_clients_and_generated_waiter(tmp_path):
                     ClientSession(br, bw, client_info=Implementation(name="codex", version="test")) as b:
                 assert "start its returned command exactly once" in (await a.initialize()).instructions
                 await b.initialize()
-                assert {tool.name for tool in (await a.list_tools()).tools} == {"join", "send", "wait"}
+                assert {tool.name for tool in (await a.list_tools()).tools} == {
+                    "join", "send", "rename", "leave", "wait",
+                }
                 assert (await a.call_tool("send", {"to": "codex", "text": "hello"})).isError
                 unpack(await a.call_tool("join", {"room": "design-review", "name": "claude"}))
                 joined = unpack(await b.call_tool("join", {"room": "design-review", "name": "codex"}))
@@ -103,7 +151,8 @@ def test_two_stdio_clients_and_generated_waiter(tmp_path):
                     try:
                         text = "quotes ' \" $(touch SHOULD_NOT_EXIST) `echo test`\n" + "x" * 501
                         sent = unpack(await a.call_tool("send", {"to": "codex", "text": text}))
-                        expected = (f"{sent['message_id']} claude\n"
+                        message_id = sent["deliveries"][0]["message_id"]
+                        expected = (f"{message_id} claude\n"
                                     "quotes ' \" $(touch SHOULD_NOT_EXIST) `echo test`\n" + "x" * 500 + "\nx\n")
                         for _ in range(100):
                             output_text = (tmp_path / "out").read_text()
@@ -115,7 +164,7 @@ def test_two_stdio_clients_and_generated_waiter(tmp_path):
                         assert output_text == expected
                         assert not (tmp_path / "SHOULD_NOT_EXIST").exists()
                         reply = unpack(await b.call_tool("send", {"to": "claude", "text": "Reviewed"}))
-                        assert reply["message_id"] > sent["message_id"]
+                        assert reply["deliveries"][0]["message_id"] > message_id
                     finally:
                         process.terminate()
                         process.wait(timeout=3)

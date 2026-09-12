@@ -21,30 +21,35 @@ Codex's `mcp add` writes to user configuration; see the [official MCP documentat
 
 ## Use
 
-Use this MCP only between different session systems; same-system sessions use native communication. For cross-system communication without an agreed room, ask before creating one. After approval, create or join it and show a copyable invitation with the room, a distinct peer name, your name, and join/wait instructions. Join with a unique name, then call wait() and start its returned command using `how`.
+Use this MCP only between different session systems; same-system sessions use native communication. For cross-system communication without an agreed room, ask before creating one. After approval, show a copyable invitation with the room, each role name, and join/wait instructions. Choose a room name that identifies the conversation. Each participant chooses the shortest clear role name, such as `plan`, `exec`, or `review`, without a vendor or session name unless duplicate roles need distinguishing.
 
 ```text
-Participant A: join(room="design-review", name="participant-a")
-Participant A: wait()  →  start the returned command using its `how` instructions
-Participant B: join(room="design-review", name="participant-b")
-Participant B: wait()  →  start the returned command using its `how` instructions
+Planner:  join(room="design-review", name="plan")
+Planner:  wait()  →  start the returned command using its `how` instructions
+Executor: join(room="design-review", name="exec")
+Executor: wait()  →  start the returned command using its `how` instructions
 
-Participant A: send(to="participant-b", text="Please check this design for missing conditions.")
+Planner: send(text="Please check this design.", to="exec")
+Planner: send(text="Status request for everyone.")  →  broadcast
 ```
 
-- `join(room, name)` returns your participant ID, registered names, and next-call instructions. Repeat the same call to refresh the list. Registration does not indicate online presence.
-- `send(to, text)` saves a message addressed to a name in your room and returns `message_id`. The recipient must have joined at least once. Messages can be saved while the recipient is offline.
+- `join(room, name)` fixes the room and sender identity for the connection, then returns the participant ID, registered role names, and next-call instructions. Repeat the same call to refresh the list. Registration does not indicate online presence.
+- `send(text, to=None)` sends to one registered role when `to` is present. Omitting `to` sends to every other registered role in the room. Offline recipients are included. The result lists each recipient and `message_id`.
+- `rename(name)` changes the current role name without changing the participant ID or pending messages.
+- `leave()` unregisters the current role, invalidates its waiter, and permits another `join()` on the same connection. Rejoining the same room and role recovers its participant ID and pending messages.
 - `wait()` returns a command and client-specific `how` instructions. The script delivers messages, acknowledges delivery, and keeps waiting.
 
 The returned `how` instructions identify the process launcher for that client. Other clients run the script with their own process tools.
 
 Run one waiter per participant and reuse it after handling messages. Calling `wait()` again returns the same script; do not start another process while the first is running. Normal MCP shutdown invalidates the waiter. After a crash, rejoining with the same name invalidates the previous waiter's session token.
 
-A single MCP connection has one fixed room and name. Another connection cannot claim that name while it is in use. Close the connection and rejoin with the same room and name to recover the participant ID and pending messages.
+A connection keeps its room and role until `rename()` or `leave()`. Joining the same room and role from a new connection transfers ownership: the previous waiter exits, and the previous connection can no longer use that identity. The new connection recovers the participant ID and pending messages.
 
 ## Delivery semantics
 
 The default database is `~/.local/share/agent-channel-mcp/channel.sqlite3`. To use a separate store, append `--db <absolute-path>` to the MCP command in both clients. Both must use the same path. The waiter checks for pending messages every 0.5 seconds. No separate HTTP server is needed.
+
+Every `join()` garbage-collects rooms whose last `join`, `send`, `rename`, or `leave` was more than 12 hours ago, provided they have no active participant and no unacknowledged message. Their acknowledged messages and participant records are deleted in the same transaction. Pending messages and active rooms are never collected.
 
 Messages are stored individually and delivered in order. A message is acknowledged only after stdout is successfully flushed or `codex queue` succeeds. Failed delivery leaves the message pending. Failed Codex queue submissions retry after 5 seconds; stdout failures stop the waiter. Fix the output error and rerun the command returned by `wait()` to resume.
 
