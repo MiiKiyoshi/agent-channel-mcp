@@ -12,6 +12,7 @@ from mcp.types import Implementation
 import pytest
 
 from agent_channel_mcp.server import Channel, create_server
+from agent_channel_mcp.waiter import lock
 
 
 def test_identity_takeover_invalidates_old_session(tmp_path):
@@ -27,8 +28,6 @@ def test_identity_takeover_invalidates_old_session(tmp_path):
             first.join("room", "claude")
         with pytest.raises(ValueError, match="no longer owns"):
             first.send("stale", to="claude")
-        with pytest.raises(ValueError, match="no longer owns"):
-            first.wait("codex")
         with pytest.raises(ValueError, match="already joined"):
             first.join("other", "claude")
         first.close()
@@ -65,8 +64,6 @@ def test_broadcast_rename_leave_and_rejoin(tmp_path):
         old_token = review.token
         assert review.leave()["left"]["name"] == "review"
         assert [p["name"] for p in plan.store.participants("room")] == ["plan", "run"]
-        with pytest.raises(ValueError, match="join"):
-            review.wait("codex")
         assert review.join("other", "review")["participant"]["room"] == "other"
         assert review.token != old_token
     finally:
@@ -75,21 +72,31 @@ def test_broadcast_rename_leave_and_rejoin(tmp_path):
         review.close()
 
 
-def test_wait_requires_join_and_old_token_is_invalidated(tmp_path):
+def test_join_returns_waiter_command_and_old_token_is_invalidated(tmp_path):
     first = Channel(tmp_path / "db")
     try:
-        with pytest.raises(ValueError, match="join"):
-            first.wait("codex")
-        identity = first.join("room", "claude")["participant"]
-        result = first.wait("claude-code")
+        result = first.join("room", "claude", "claude-code")
+        identity = result["participant"]
+        assert result["waiter"] == "missing"
         assert "Monitor(" in result["how"]
         assert Path(shlex.split(result["command"])[1]).exists()
-        assert first.wait("claude-code") == result
-        codex_wait = first.wait("codex")
+        assert first.join("room", "claude", "claude-code") == result
+        lock_path = first.store.path.with_name(f"{first.store.path.name}.{identity['id']}.wait.lock")
+        handle = lock(lock_path, owner=first.token)
+        try:
+            assert first.join("room", "claude", "claude-code")["waiter"] == "active"
+        finally:
+            handle.close()
+
+        codex = Channel(tmp_path / "codex-db")
+        codex_wait = codex.join("room", "codex", "codex")
         assert "--codex" in codex_wait["command"]
         assert 'sandbox_permissions="require_escalated"' in codex_wait["how"]
         assert 'justification="Allow the channel waiter' in codex_wait["how"]
-        assert "Keep the turn active" in first.wait("other")["how"]
+        codex.close()
+        other = Channel(tmp_path / "other-db")
+        assert "Keep the turn active" in other.join("room", "other")["how"]
+        other.close()
         token = first.token
     finally:
         first.close()
@@ -102,7 +109,7 @@ def test_wait_requires_join_and_old_token_is_invalidated(tmp_path):
         second.close()
 
 
-def test_instructions_lead_from_join_to_wait(tmp_path):
+def test_instructions_lead_from_join_to_waiter_command(tmp_path):
     channel = Channel(tmp_path / "db")
     try:
         instructions = create_server(channel).instructions
@@ -110,14 +117,16 @@ def test_instructions_lead_from_join_to_wait(tmp_path):
         assert "same-system sessions use native communication" in instructions
         assert "ask before creating one" in instructions
         assert "copyable invitation" in instructions
-        assert "start its returned command exactly once" in instructions
+        assert "start command exactly once" in instructions
+        assert "Do not poll" in instructions
         assert "takes ownership" in instructions
         assert "shortest clear role name" in instructions
         assert "omit to to broadcast" in instructions
         for kept in ("500 characters", "'id sender'",
                      "no user authorization", "Reply only when needed"):
             assert kept in instructions
-        assert channel.join("room", "claude")["next"].startswith("wait() and start its command once;")
+        joined = channel.join("room", "claude")
+        assert joined["next"].startswith("If waiter is missing, start command exactly once")
     finally:
         channel.close()
 
@@ -137,16 +146,17 @@ def test_two_stdio_clients_and_generated_waiter(tmp_path):
         async with stdio_client(params) as (ar, aw), stdio_client(params) as (br, bw):
             async with ClientSession(ar, aw, client_info=Implementation(name="claude-code", version="test")) as a, \
                     ClientSession(br, bw, client_info=Implementation(name="codex", version="test")) as b:
-                assert "start its returned command exactly once" in (await a.initialize()).instructions
+                assert "start command exactly once" in (await a.initialize()).instructions
                 await b.initialize()
                 assert {tool.name for tool in (await a.list_tools()).tools} == {
-                    "join", "send", "rename", "leave", "wait",
+                    "join", "send", "rename", "leave",
                 }
                 assert (await a.call_tool("send", {"to": "codex", "text": "hello"})).isError
                 unpack(await a.call_tool("join", {"room": "design-review", "name": "claude"}))
                 joined = unpack(await b.call_tool("join", {"room": "design-review", "name": "codex"}))
                 assert len(joined["participants"]) == 2
-                waiting = unpack(await b.call_tool("wait", {}))
+                waiting = joined
+                assert waiting["waiter"] == "missing"
                 assert "codex queue" in waiting["how"]
                 assert 'sandbox_permissions="require_escalated"' in waiting["how"]
                 with (tmp_path / "out").open("w") as output:
