@@ -34,8 +34,25 @@ class Store:
                 "text TEXT NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0)"
             )
             self.db.execute(
+                "CREATE TABLE IF NOT EXISTS waiter_runs ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "participant_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE, "
+                "token TEXT, pid INTEGER NOT NULL, started_at INTEGER NOT NULL, "
+                "heartbeat_at INTEGER NOT NULL, ended_at INTEGER, exit_kind TEXT, "
+                "exit_code INTEGER, detail TEXT, last_error TEXT, last_error_at INTEGER)"
+            )
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS waiter_requests ("
+                "participant_id TEXT PRIMARY KEY REFERENCES participants(id) ON DELETE CASCADE, "
+                "token TEXT NOT NULL, codex_thread TEXT NOT NULL, requested_at INTEGER NOT NULL)"
+            )
+            self.db.execute(
                 "CREATE INDEX IF NOT EXISTS inbox "
                 "ON messages(recipient_id, acknowledged, id)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS waiter_history "
+                "ON waiter_runs(participant_id, id)"
             )
             columns = {
                 row["name"] for row in self.db.execute("PRAGMA table_info(participants)")
@@ -166,6 +183,10 @@ class Store:
             if participant is None:
                 raise ValueError("This MCP session no longer owns its identity")
             self.db.execute(
+                "DELETE FROM waiter_requests WHERE participant_id=? AND token=?",
+                (participant_id, token),
+            )
+            self.db.execute(
                 "UPDATE participants SET token=NULL, left_at=? WHERE id=? AND token=?",
                 (now, participant_id, token),
             )
@@ -192,12 +213,19 @@ class Store:
     def activate(self, participant_id: str, token: str) -> None:
         with self.db:
             self.db.execute(
+                "DELETE FROM waiter_requests WHERE participant_id=?", (participant_id,)
+            )
+            self.db.execute(
                 "UPDATE participants SET token=? WHERE id=? AND left_at IS NULL",
                 (token, participant_id),
             )
 
     def deactivate(self, participant_id: str, token: str) -> None:
         with self.db:
+            self.db.execute(
+                "DELETE FROM waiter_requests WHERE participant_id=? AND token=?",
+                (participant_id, token),
+            )
             self.db.execute(
                 "UPDATE participants SET token=NULL WHERE id=? AND token=?", (participant_id, token)
             )
@@ -207,6 +235,100 @@ class Store:
             "SELECT 1 FROM participants WHERE id=? AND token=? AND left_at IS NULL",
             (participant_id, token),
         ).fetchone() is not None
+
+    def waiter_started(self, participant_id: str, token: str | None, pid: int) -> int:
+        now = int(time.time())
+        with self.db:
+            self.db.execute(
+                "UPDATE waiter_runs SET ended_at=?, exit_kind='disappeared', "
+                "detail='lock was free when a replacement waiter started' "
+                "WHERE participant_id=? AND ended_at IS NULL",
+                (now, participant_id),
+            )
+            cursor = self.db.execute(
+                "INSERT INTO waiter_runs(participant_id, token, pid, started_at, heartbeat_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (participant_id, token, pid, now, now),
+            )
+        return cursor.lastrowid
+
+    def waiter_heartbeat(self, run_id: int) -> None:
+        with self.db:
+            self.db.execute(
+                "UPDATE waiter_runs SET heartbeat_at=? WHERE id=? AND ended_at IS NULL",
+                (int(time.time()), run_id),
+            )
+
+    def waiter_error(self, run_id: int, detail: str) -> None:
+        now = int(time.time())
+        with self.db:
+            self.db.execute(
+                "UPDATE waiter_runs SET heartbeat_at=?, last_error=?, last_error_at=? "
+                "WHERE id=? AND ended_at IS NULL",
+                (now, detail, now, run_id),
+            )
+
+    def waiter_finished(
+        self,
+        run_id: int,
+        exit_kind: str,
+        exit_code: int,
+        detail: str,
+    ) -> None:
+        now = int(time.time())
+        with self.db:
+            self.db.execute(
+                "UPDATE waiter_runs SET heartbeat_at=?, ended_at=?, exit_kind=?, "
+                "exit_code=?, detail=? WHERE id=? AND ended_at IS NULL",
+                (now, now, exit_kind, exit_code, detail, run_id),
+            )
+
+    def last_waiter(self, participant_id: str, token: str | None = None) -> dict | None:
+        query = (
+            "SELECT id, pid, started_at, heartbeat_at, ended_at, exit_kind, exit_code, "
+            "detail, last_error, last_error_at FROM waiter_runs WHERE participant_id=?"
+        )
+        values: tuple = (participant_id,)
+        if token is not None:
+            query += " AND token=?"
+            values += (token,)
+        row = self.db.execute(query + " ORDER BY id DESC LIMIT 1", values).fetchone()
+        return dict(row) if row is not None else None
+
+    def request_waiter(self, participant_id: str, token: str, codex_thread: str) -> None:
+        if not codex_thread.strip():
+            raise ValueError("Codex thread ID must not be blank")
+        with self.db:
+            if not self.is_active(participant_id, token):
+                raise ValueError("This MCP session no longer owns its identity")
+            self.db.execute(
+                "INSERT INTO waiter_requests(participant_id, token, codex_thread, requested_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(participant_id) DO UPDATE SET "
+                "token=excluded.token, codex_thread=excluded.codex_thread, "
+                "requested_at=excluded.requested_at",
+                (participant_id, token, codex_thread, int(time.time())),
+            )
+
+    def take_waiter_request(self, participant_id: str, token: str) -> dict | None:
+        with self.db:
+            row = self.db.execute(
+                "SELECT codex_thread, requested_at FROM waiter_requests "
+                "WHERE participant_id=? AND token=?",
+                (participant_id, token),
+            ).fetchone()
+            if row is not None:
+                self.db.execute(
+                    "DELETE FROM waiter_requests WHERE participant_id=? AND token=?",
+                    (participant_id, token),
+                )
+        return dict(row) if row is not None else None
+
+    def cancel_waiter_request(self, participant_id: str, token: str) -> None:
+        with self.db:
+            self.db.execute(
+                "DELETE FROM waiter_requests WHERE participant_id=? AND token=?",
+                (participant_id, token),
+            )
 
     def close(self) -> None:
         self.db.close()
