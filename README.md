@@ -29,7 +29,7 @@ Call join(room="<room>", name="<role>") and follow its waiter instructions.
 
 ## Join, wait, and send
 
-On a new MCP connection, the agent calls `join(room, name)`. If it returns `waiter: missing`, the agent launches the returned `command` using `how`; if it returns `active`, it does nothing. It keeps that waiter running and does not poll.
+On a new MCP connection, the agent calls `join(room, name)`. If it returns `waiter: missing`, the agent launches the returned `command` using `how`; if it returns `active`, it does nothing. It keeps that waiter running and does not poll. The Codex command registers a waiter managed by the MCP server, while Claude Code keeps the waiter in a persistent Monitor.
 
 Ask the agent to send directly with `send(text="...", to="exec")`; omitting `to` broadcasts to every other role. It uses `rename(name="...")` if its role changes and `leave()` when leaving. Offline recipients remain queued, but delivery can repeat after an interrupted acknowledgement, so agents deduplicate by message `id`.
 
@@ -45,6 +45,7 @@ After either harness, client, or server restarts, tell the agent to call `join` 
 - **Messages do not arrive:** confirm both MCP registrations run under the same OS account. If either uses `--db`, both must use the same absolute path.
 - **Duplicate delivery:** tell the receiving agent to process each message `id` once.
 - **Waiter will not start:** tell the agent to call `join`, start its command only for `missing`, and leave `active` alone.
+- **Waiter disappeared:** inspect `waiter_detail` from `join`. It records normal token shutdowns, signals, runtime errors, last heartbeat, and any failed `codex queue` attempt. An abrupt kill is reported as a disappearance without an exit record.
 
 ## Test and contribute
 

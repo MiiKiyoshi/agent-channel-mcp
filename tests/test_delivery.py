@@ -13,6 +13,7 @@ import time
 import pytest
 
 from agent_channel_mcp.store import Store
+from agent_channel_mcp.server import Channel
 from agent_channel_mcp.waiter import render_message
 
 
@@ -173,6 +174,13 @@ def test_existing_database_is_migrated_without_losing_participants(tmp_path):
         {"id": "participant-id", "room": "room", "name": "plan"}
     ]
     assert store.db.execute("SELECT 1 FROM rooms WHERE name='room'").fetchone() is not None
+    waiter_columns = {
+        row["name"] for row in store.db.execute("PRAGMA table_info(waiter_runs)")
+    }
+    assert {"pid", "heartbeat_at", "exit_kind", "last_error"} <= waiter_columns
+    assert store.db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='waiter_requests'"
+    ).fetchone() is not None
     store.close()
 
 
@@ -285,6 +293,12 @@ def test_waiter_retries_failed_codex_queue_without_ack(tmp_path):
     wait_for(lambda: log.exists() and len(log.read_text(encoding="utf-8").splitlines()) > 0)
     time.sleep(0.1)
     assert store.pending(receiver["id"]) is not None
+    run = wait_for(lambda: store.last_waiter(receiver["id"], token))
+    wait_for(lambda: store.last_waiter(receiver["id"], token)["last_error"])
+    assert store.last_waiter(receiver["id"], token)["last_error"] == (
+        f"codex queue exited 7 for message {store.pending(receiver['id'])['id']}"
+    )
+    assert run["ended_at"] is None
     _stop_waiter(process, store, receiver, token)
     store.close()
 
@@ -408,3 +422,111 @@ def test_new_session_waiter_takes_over_after_token_change(tmp_path):
         if old.stderr:
             old.stderr.close()
         store.close()
+
+
+def test_waiter_records_signal_exit_and_join_reports_abrupt_loss(tmp_path):
+    channel = Channel(tmp_path / "channel.sqlite3")
+    joined = channel.join("room", "plan")
+    participant = joined["participant"]
+    process = subprocess.Popen(
+        _waiter_command(channel.store.path, participant["id"], channel.token),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        wait_for(lambda: channel.store.last_waiter(participant["id"], channel.token))
+        process.terminate()
+        assert process.wait(timeout=2) == 128 + 15
+        run = channel.store.last_waiter(participant["id"], channel.token)
+        assert run["exit_kind"] == "signal"
+        assert run["exit_code"] == 128 + 15
+        assert run["detail"] == "SIGTERM"
+        signaled = channel.join("room", "plan")
+        assert signaled["waiter"] == "missing"
+        assert signaled["waiter_detail"]["reason"] == "SIGTERM"
+        assert signaled["waiter_detail"]["exit_kind"] == "signal"
+
+        replacement = subprocess.Popen(
+            _waiter_command(channel.store.path, participant["id"], channel.token),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        wait_for(
+            lambda: channel.store.last_waiter(participant["id"], channel.token)["id"]
+            > run["id"]
+        )
+        replacement.kill()
+        replacement.wait(timeout=2)
+        wait_for(lambda: channel.join("room", "plan")["waiter"] == "missing")
+        status = channel.join("room", "plan")
+        assert status["waiter_detail"]["reason"] == (
+            "process disappeared without an exit record"
+        )
+        assert status["waiter_detail"]["last_seen_at"] >= run["ended_at"]
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        if "replacement" in locals() and replacement.poll() is None:
+            replacement.kill()
+            replacement.wait(timeout=2)
+        for candidate in (process, locals().get("replacement")):
+            if candidate is not None and candidate.stdout:
+                candidate.stdout.close()
+            if candidate is not None and candidate.stderr:
+                candidate.stderr.close()
+        channel.close()
+
+
+def test_mcp_managed_codex_waiter_outlives_launcher_and_delivers(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "channel.sqlite3"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "codex-args.log"
+    _codex_stub(bin_dir)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("CODEX_ARGS_LOG", str(log))
+    channel = Channel(db)
+    sender = channel.store.participant("room", "sender")
+    joined = channel.join("room", "receiver", "codex")
+    receiver = joined["participant"]
+    token = channel.token
+    try:
+        launcher = subprocess.run(
+            _waiter_command(db, receiver["id"], token)
+            + ["--register", "--codex", "thread-42"],
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=4,
+        )
+        assert launcher.returncode == 0, launcher.stderr
+        run = wait_for(lambda: channel.store.last_waiter(receiver["id"], token))
+        assert run["ended_at"] is None
+        assert channel.join("room", "receiver", "codex")["waiter"] == "active"
+
+        message_id = send_one(
+            channel.store, sender["id"], receiver["name"], "managed"
+        )
+        wait_for(lambda: channel.store.pending(receiver["id"]) is None)
+        args = log.read_bytes().split(b"\0")[:-1]
+        assert args[args.index(b"--message") + 1] == (
+            f"{message_id} sender\nmanaged".encode()
+        )
+    finally:
+        channel.store.deactivate(receiver["id"], token)
+        wait_for(
+            lambda: (
+                channel.store.last_waiter(receiver["id"], token) is not None
+                and channel.store.last_waiter(receiver["id"], token)["ended_at"]
+                is not None
+            )
+        )
+        run = channel.store.last_waiter(receiver["id"], token)
+        assert run["exit_kind"] == "normal"
+        assert run["detail"] == "token inactive"
+        channel.close()

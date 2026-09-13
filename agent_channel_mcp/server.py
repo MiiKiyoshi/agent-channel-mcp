@@ -3,12 +3,14 @@ import fcntl
 import shlex
 import sys
 import tempfile
+import threading
 import uuid
 from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
 from .store import Store
+from .waiter import run as run_waiter
 
 
 class Channel:
@@ -17,6 +19,9 @@ class Channel:
         self.identity = None
         self.script = None
         self.token = None
+        self.supervisor_stop = None
+        self.supervisor = None
+        self.worker = None
 
     def join(self, room: str, name: str, client_name: str = "other") -> dict:
         if self.identity is not None:
@@ -60,6 +65,7 @@ class Channel:
     def leave(self) -> dict:
         identity = self.require_identity()
         left = self.store.leave(identity["id"], self.token)
+        self._stop_supervisor()
         if self.script is not None:
             self.script.unlink(missing_ok=True)
         self.identity = None
@@ -67,21 +73,72 @@ class Channel:
         self.token = None
         return {"left": left}
 
-    def _waiter_state(self, participant_id: str) -> str:
+    def _waiter_state(self, participant_id: str) -> tuple[str, dict | None]:
         path = self.store.path.with_name(f"{self.store.path.name}.{participant_id}.wait.lock")
         try:
             handle = path.open("r+")
         except FileNotFoundError:
-            return "missing"
+            return "missing", self._waiter_detail(participant_id)
         try:
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 handle.seek(0)
-                return "active" if handle.read().strip() == self.token else "missing"
-            return "missing"
+                if handle.read().strip() == self.token:
+                    run = self.store.last_waiter(participant_id, self.token)
+                    if run is not None and run["last_error"] is not None:
+                        return "active", {"last_error": run["last_error"],
+                                          "last_error_at": run["last_error_at"]}
+                    return "active", None
+                return "missing", self._waiter_detail(participant_id)
+            return "missing", self._waiter_detail(participant_id)
         finally:
             handle.close()
+
+    def _waiter_detail(self, participant_id: str) -> dict:
+        run = self.store.last_waiter(participant_id, self.token)
+        if run is None:
+            previous = self.store.last_waiter(participant_id)
+            if previous is None or (
+                previous["ended_at"] is not None
+                and previous["exit_kind"] == "normal"
+                and previous["last_error"] is None
+            ):
+                return {"reason": "not started for this connection"}
+            run = previous
+            current_reason = "not started for this connection; previous waiter "
+            previous_connection = True
+        else:
+            current_reason = ""
+            previous_connection = False
+        if run["ended_at"] is None:
+            reason = current_reason + (
+                "disappeared without an exit record"
+                if previous_connection
+                else "process disappeared without an exit record"
+            )
+        else:
+            reason = current_reason + (run["detail"] or run["exit_kind"])
+        detail = {
+            "reason": reason,
+            "pid": run["pid"],
+            "started_at": run["started_at"],
+            "last_seen_at": run["heartbeat_at"],
+        }
+        if previous_connection:
+            detail["previous_connection"] = True
+        if run["ended_at"] is not None:
+            detail.update({
+                "ended_at": run["ended_at"],
+                "exit_kind": run["exit_kind"],
+                "exit_code": run["exit_code"],
+            })
+        if run["last_error"] is not None:
+            detail.update({
+                "last_error": run["last_error"],
+                "last_error_at": run["last_error_at"],
+            })
+        return detail
 
     def _waiting(self, client_name: str) -> dict:
         identity = self.require_identity()
@@ -100,23 +157,80 @@ class Channel:
         if "claude" in name:
             how = "Monitor(command=<command>, persistent=true, timeout_ms=3600000); then end the turn."
         elif "codex" in name:
-            command += ' --codex "${CODEX_THREAD_ID:?CODEX_THREAD_ID is required}"'
+            self._start_supervisor(identity["id"], self.token)
+            command += ' --register --codex "${CODEX_THREAD_ID:?CODEX_THREAD_ID is required}"'
             how = ('Run command with exec_command(yield_time_ms=1000, '
                    'sandbox_permissions="require_escalated", '
                    'justification="Allow the channel waiter to deliver messages to this Codex thread?"), '
-                   'then end the turn. Requires codex queue; do not poll.')
+                   'then end the turn. It returns after the MCP-managed waiter is active. '
+                   'Requires codex queue; do not poll.')
         else:
             how = ("Run command and read stdout. Keep the turn active unless your client "
                    "supports waking on output.")
-        return {
-            "waiter": self._waiter_state(identity["id"]),
+        state, detail = self._waiter_state(identity["id"])
+        result = {
+            "waiter": state,
             "command": command,
             "how": how + " Reuse one waiter; deduplicate by id.",
         }
+        if detail is not None:
+            result["waiter_detail"] = detail
+        return result
+
+    def _start_supervisor(self, participant_id: str, token: str) -> None:
+        if self.supervisor is not None and self.supervisor.is_alive():
+            return
+        self.supervisor_stop = threading.Event()
+        self.supervisor = threading.Thread(
+            target=self._supervise,
+            args=(participant_id, token, self.supervisor_stop),
+            daemon=True,
+            name=f"agent-channel-supervisor-{participant_id}",
+        )
+        self.supervisor.start()
+
+    def _supervise(
+        self, participant_id: str, token: str, stop: threading.Event
+    ) -> None:
+        store = Store(self.store.path)
+        try:
+            while not stop.is_set():
+                request = store.take_waiter_request(participant_id, token)
+                if request is not None and (
+                    self.worker is None or not self.worker.is_alive()
+                ):
+                    self.worker = threading.Thread(
+                        target=self._run_worker,
+                        args=(participant_id, token, request["codex_thread"]),
+                        daemon=True,
+                        name=f"agent-channel-waiter-{participant_id}",
+                    )
+                    self.worker.start()
+                stop.wait(0.1)
+        finally:
+            store.close()
+
+    def _run_worker(self, participant_id: str, token: str, codex_thread: str) -> None:
+        try:
+            run_waiter(self.store.path, participant_id, codex_thread, token)
+        except Exception:
+            pass
+
+    def _stop_supervisor(self) -> None:
+        if self.supervisor_stop is not None:
+            self.supervisor_stop.set()
+        if self.supervisor is not None:
+            self.supervisor.join(timeout=1)
+        if self.worker is not None:
+            self.worker.join(timeout=1)
+        self.supervisor_stop = None
+        self.supervisor = None
+        self.worker = None
 
     def close(self) -> None:
         if self.identity is not None:
             self.store.deactivate(self.identity["id"], self.token)
+        self._stop_supervisor()
         if self.script is not None:
             self.script.unlink(missing_ok=True)
         self.store.close()
@@ -138,7 +252,8 @@ def create_server(channel: Channel) -> FastMCP:
 
     @mcp.tool()
     async def join(room: str, name: str, ctx: Context) -> dict:
-        """Join a room and return identity, participants, waiter state, command, and client-specific launch instructions.
+        """Join a room and return identity, participants, waiter state or diagnostics,
+        command, and client-specific launch instructions.
 
         On each new MCP connection, call join. Start command when waiter is missing;
         do nothing when it is active. A new connection with the same room and name takes ownership.
