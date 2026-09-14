@@ -354,3 +354,50 @@ def test_a_message_whose_ack_met_a_busy_database_is_delivered_again_with_the_sam
     assert delivered == [f"{first} room plan", f"{first} room plan", f"{second} room plan"]
     assert AckBusyOnce.busy_acks == 1
     store.close()
+
+
+# A request and a run are told apart by ids, not by the second they were made in.
+
+def test_finishing_a_request_leaves_a_newer_one_made_in_the_same_second(tmp_path, monkeypatch):
+    monkeypatch.setattr(time, "time", lambda: 1800000000.0)
+    store = Store(tmp_path / "db")
+    participant = store.participant("room", "exec")
+    store.activate(participant["id"], "tok")
+    old = store.request_waiter("tok", "thread-old")
+    read = store.waiter_request("tok")
+    assert read["request_id"] == old
+    new = store.request_waiter("tok", "thread-new")
+    store.finish_waiter_request("tok", read["request_id"])          # the old one, already read
+    assert store.waiter_request("tok") == {
+        "codex_thread": "thread-new", "requested_at": 1800000000, "request_id": new,
+    }
+    store.cancel_waiter_request("tok", old)                          # register's own only
+    assert store.waiter_request("tok")["request_id"] == new
+    store.cancel_waiter_request("tok", new)
+    assert store.waiter_request("tok") is None
+    store.close()
+
+
+def test_an_earlier_run_in_the_same_second_is_not_taken_for_this_attempt(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _codex_stub(bin_dir)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("CODEX_ARGS_LOG", str(tmp_path / "codex-args.log"))
+    db = tmp_path / "db"
+    channel = Channel(db)
+    joined = channel.join("room", "exec", "claude")
+    token = channel.token
+    store = channel.store
+    store.waiter_started(joined["participant"]["id"], token, 4242)   # an earlier attempt's row,
+    store.waiter_finished(token, "error", 1, "an earlier attempt")   # closed in this same second
+    request_id = store.request_waiter(token, "thread-1")
+    request = store.waiter_request(token)
+    runs_before = store.latest_run_id(token)
+    channel.worker_failure = {"request_id": request_id, "runs_before": runs_before,
+                              "detail": "ValueError: Already running", "at": time.monotonic() - 1}
+    channel._serve_request(store, token, request)
+    assert store.waiter_request(token)["request_id"] == request_id  # not taken as recorded
+    assert channel.worker is not None                                # tried again instead
+    wait_for(lambda: store.latest_run_id(token) > runs_before)       # and this one ran
+    channel.close()

@@ -218,7 +218,7 @@ def test_last_leave_and_full_takeover_issue_a_fresh_token(tmp_path):
         assert not agent.store.token_active(second_token)
         with agent.store.db:  # a registration the supervisor has not taken yet
             agent.store.db.execute(
-                "INSERT INTO waiter_requests VALUES (?, 'thread-9', 1)", (second_token,)
+                "INSERT INTO waiter_requests VALUES (?, 'thread-9', 1, NULL)", (second_token,)
             )
         assert agent.join("r4", "exec", "claude-code")["rooms"] == ["r4"]
         assert agent.token != second_token and agent.script != second_script

@@ -331,50 +331,52 @@ class Channel:
                 store.close()
 
     def _serve_request(self, store: Store, token: str, request: dict) -> None:
-        requested_at = request["requested_at"]
+        request_id = request["request_id"]
         run = store.last_waiter_for_token(token)
         if run is not None and run["ended_at"] is None and lock_owned(
             lock_path(store.path, token), token
         ):
             # A waiter of this connection is running, this thread's or an earlier one's.
-            store.finish_waiter_request(token, requested_at)
+            store.finish_waiter_request(token, request_id)
             self.worker_failure = None
             return
         if self.worker is not None and self.worker.is_alive():
             return
         failure = self.worker_failure
-        if failure is not None and failure["requested_at"] == requested_at:
-            if run is not None and run["started_at"] >= requested_at:
+        if failure is not None and failure["request_id"] == request_id:
+            if store.latest_run_id(token) > failure["runs_before"]:
                 # It got as far as its run row, and that row carries the failure.
-                store.finish_waiter_request(token, requested_at)
+                store.finish_waiter_request(token, request_id)
                 return
-            if time.time() - requested_at >= WAITER_START_WINDOW_SECONDS:
+            if time.time() - request["requested_at"] >= WAITER_START_WINDOW_SECONDS:
                 # Tried for as long as register() waits: the cause goes on record now,
                 # or on the next pass if the database is busy for this write too.
                 store.waiter_start_failed(token, os.getpid(), failure["detail"])
-                store.finish_waiter_request(token, requested_at)
+                store.finish_waiter_request(token, request_id)
                 self.worker_failure = None
                 return
             if time.monotonic() - failure["at"] < 0.5:
                 return
         self.worker = threading.Thread(
             target=self._run_worker,
-            args=(token, request["codex_thread"], requested_at),
+            args=(token, request["codex_thread"], request_id, store.latest_run_id(token)),
             daemon=True,
             name=f"agent-channel-waiter-{token}",
         )
         self.worker.start()
 
-    def _run_worker(self, token: str, codex_thread: str, requested_at: int) -> None:
+    def _run_worker(self, token: str, codex_thread: str, request_id: str,
+                    runs_before: int) -> None:
         # A failure is kept here and said on stderr: while the database is busy it
-        # cannot be written, and the supervisor records it once it can.
+        # cannot be written, and the supervisor records it once it can. runs_before
+        # is the newest run row when this attempt began; a newer one is this attempt's.
         try:
             run_waiter(self.store.path, token, codex_thread)
             self.worker_failure = None
         except Exception as error:
             detail = f"{type(error).__name__}: {error}"
-            self.worker_failure = {"requested_at": requested_at, "detail": detail,
-                                   "at": time.monotonic()}
+            self.worker_failure = {"request_id": request_id, "runs_before": runs_before,
+                                   "detail": detail, "at": time.monotonic()}
             print(f"Waiter did not run: {detail}", file=sys.stderr, flush=True)
 
     def _stop_supervisor(self) -> None:
