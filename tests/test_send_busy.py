@@ -95,10 +95,64 @@ def test_a_writer_holding_the_lock_longer_than_one_attempt_is_waited_out(tmp_pat
     store.close()
 
 
+def _commit_in_a_loop(db: Path, seconds: float, hold: float) -> subprocess.Popen:
+    """Another process committing as a heartbeat does, each commit keeping the write
+    lock for `hold` seconds, as a commit does while its fsync waits on a loaded disk."""
+    script = (
+        "import sqlite3, sys, time\n"
+        "c = sqlite3.connect(sys.argv[1], timeout=10)\n"
+        "print('running', flush=True)\n"
+        f"end = time.monotonic() + {seconds}\n"
+        "while time.monotonic() < end:\n"
+        "    c.execute('BEGIN IMMEDIATE')\n"
+        "    c.execute(\"UPDATE rooms SET last_activity=last_activity WHERE name='room'\")\n"
+        f"    time.sleep({hold})\n"
+        "    c.commit()\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(db)], stdout=subprocess.PIPE, text=True
+    )
+    assert process.stdout.readline().strip() == "running"
+    return process
+
+
+def test_a_store_connection_fsyncs_at_checkpoints_rather_than_under_the_write_lock(tmp_path):
+    store = Store(tmp_path / "db")
+    assert store.db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    assert store.db.execute("PRAGMA synchronous").fetchone()[0] == 1      # NORMAL
+    store.close()
+
+
+def test_sends_and_reads_go_through_while_heartbeats_keep_the_lock_nearly_always(tmp_path):
+    """Three other processes commit back to back, each commit holding the lock 150 ms:
+    the lock is taken most of the time, as it was with a heartbeat per server and per
+    waiter stalled on fsync. Every send still lands once, and reads never wait."""
+    db = tmp_path / "db"
+    store, plan, execute, review = _room(db)
+    writers = [_commit_in_a_loop(db, 8, 0.15) for _ in range(3)]
+    try:
+        started = time.monotonic()
+        for round_ in range(4):
+            to = "exec" if round_ % 2 == 0 else None
+            deliveries = store.send(plan["id"], f"round {round_}", to=to)
+            assert [d["to"] for d in deliveries] == (["exec"] if to else ["exec", "review"])
+            assert store.is_active(plan["id"], "none") is False      # a read, at once
+            assert store.pending_for_token("none") is None
+        took = time.monotonic() - started
+    finally:
+        for writer in writers:
+            writer.wait(timeout=20)
+    assert took < 4 * Store.SEND_DEADLINE_SECONDS
+    assert _count(db, execute["id"]) == 4
+    assert _count(db, review["id"]) == 2
+    assert _count(db, plan["id"]) == 0
+    store.close()
+
+
 def test_a_writer_holding_the_lock_past_the_deadline_fails_within_it_and_writes_nothing(tmp_path):
     db = tmp_path / "db"
     store, plan, execute, review = _room(db)
-    holder = _hold_write_lock(db, Store.SEND_DEADLINE_SECONDS + 3)
+    holder = _hold_write_lock(db, Store.SEND_DEADLINE_SECONDS + 1)
     try:
         started = time.monotonic()
         with pytest.raises(sqlite3.OperationalError, match="^database is locked$"):
