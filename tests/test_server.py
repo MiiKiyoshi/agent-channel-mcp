@@ -28,8 +28,10 @@ def test_identity_takeover_invalidates_old_session(tmp_path):
             first.join("room", "claude")
         with pytest.raises(ValueError, match="no longer owns"):
             first.send("stale", to="claude")
-        with pytest.raises(ValueError, match="already joined"):
-            first.join("other", "claude")
+        old_token = first.token
+        # Every room was taken over: joining elsewhere starts a fresh connection identity.
+        assert first.join("other", "claude")["rooms"] == ["other"]
+        assert first.token != old_token
         first.close()
         first = None
         assert second.store.is_active(identity["id"], second.token)
@@ -221,28 +223,32 @@ def test_instructions_lead_from_join_to_waiter_command(tmp_path):
         server = create_server(channel)
         instructions = server.instructions
         descriptions = {tool.name: tool.description for tool in asyncio.run(server.list_tools())}
-        join = descriptions["join"]
+        join = " ".join(descriptions["join"].split())  # docstring line breaks are not part of the text
         assert "only across different session systems" in instructions
         assert "same-system sessions use native communication" in instructions
-        assert "Join or create a room" in join
-        assert "When asked to create one, choose a descriptive room name" in join
+        assert "Join or create a room; call again to add rooms" in join
+        assert "When asked to create one, choose a descriptive name" in join
         assert "otherwise ask before creating" in join
-        assert "copyable invitation, not a code/link" in join
-        assert 'join(room="...", name="<peer role>")' in join
-        assert "short, distinct roles suited" in join
+        assert "Invitation (text, not a link)" in join
+        assert 'join(room="...",' in join and 'name="<peer role>")' in join
+        assert "short, distinct, no whitespace" in join
         assert "discuss" in join
+        assert "command/how only while waiter is offline" in join
+        assert len(join) <= 450
         assert "waiter=offline, start command using how" in instructions
-        assert "registered_roles (not left)" in join
         assert "Do not poll or start duplicate waiters" in instructions
         assert "Do not poll" in instructions
         assert "takes ownership" in join
         assert "omit to to broadcast" in descriptions["send"]
+        assert "room is required when joined to more than one" in descriptions["send"]
         assert "copyable invitation" not in instructions
-        for kept in ("500 UTF-16 code units", "'id sender'", "deduplicate by id",
+        for kept in ("500 UTF-16 code units", "'id room sender'", "deduplicate by id",
+                     "pass room to send, rename and leave",
                      "explicitly delegated authority", "Reply only when needed"):
             assert kept in instructions
         joined = channel.join("room", "claude")
-        assert joined["next"].startswith("If waiter is offline, start command using how")
+        assert "next" not in joined
+        assert joined["rooms"] == ["room"]
     finally:
         channel.close()
 
@@ -308,7 +314,7 @@ def test_two_stdio_clients_and_generated_waiter(tmp_path):
                 text = "quotes ' \" $(touch SHOULD_NOT_EXIST) `echo test`\n" + "x" * 501
                 sent = unpack(await a.call_tool("send", {"to": "codex", "text": text}))
                 message_id = sent["deliveries"][0]["message_id"]
-                expected = (f"{message_id} claude\n"
+                expected = (f"{message_id} design-review claude\n"
                             "quotes ' \" $(touch SHOULD_NOT_EXIST) `echo test`\n"
                             + "x" * 500 + "\nx")
                 for _ in range(100):
@@ -324,4 +330,21 @@ def test_two_stdio_clients_and_generated_waiter(tmp_path):
                 assert not (tmp_path / "SHOULD_NOT_EXIST").exists()
                 reply = unpack(await b.call_tool("send", {"to": "claude", "text": "Reviewed"}))
                 assert reply["deliveries"][0]["message_id"] > message_id
+
+                # A second room on both connections is served by the same managed waiter.
+                unpack(await a.call_tool("join", {"room": "second", "name": "claude"}))
+                second = unpack(await b.call_tool("join", {"room": "second", "name": "codex"}))
+                assert second["rooms"] == ["design-review", "second"]
+                assert second["waiter"] == "active" and "command" not in second
+                assert (await a.call_tool("send", {"to": "codex", "text": "no room"})).isError
+                sent = unpack(await a.call_tool(
+                    "send", {"to": "codex", "text": "room two", "room": "second"}
+                ))
+                expected = f"{sent['deliveries'][0]['message_id']} second claude\nroom two".encode()
+                for _ in range(100):
+                    if expected in codex_log.read_bytes().split(b"\0"):
+                        break
+                    await asyncio.sleep(0.05)
+                else:
+                    pytest.fail("managed waiter did not deliver the second room's message")
     asyncio.run(asyncio.wait_for(scenario(), timeout=20))

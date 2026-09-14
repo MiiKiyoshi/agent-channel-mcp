@@ -163,7 +163,21 @@ def test_existing_database_is_migrated_without_losing_participants(tmp_path):
             id TEXT PRIMARY KEY, room TEXT NOT NULL, name TEXT NOT NULL,
             token TEXT, UNIQUE(room, name)
         );
-        INSERT INTO participants(id, room, name) VALUES ('participant-id', 'room', 'plan');
+        INSERT INTO participants(id, room, name, token)
+            VALUES ('participant-id', 'room', 'plan', 'session-token');
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_id TEXT NOT NULL REFERENCES participants(id),
+            recipient_id TEXT NOT NULL REFERENCES participants(id),
+            text TEXT NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO messages(sender_id, recipient_id, text)
+            VALUES ('participant-id', 'participant-id', 'kept');
+        CREATE TABLE waiter_requests (
+            participant_id TEXT PRIMARY KEY REFERENCES participants(id) ON DELETE CASCADE,
+            token TEXT NOT NULL, codex_thread TEXT NOT NULL, requested_at INTEGER NOT NULL
+        );
+        INSERT INTO waiter_requests VALUES ('participant-id', 'session-token', 'thread-7', 5);
     """)
     db.close()
 
@@ -173,14 +187,19 @@ def test_existing_database_is_migrated_without_losing_participants(tmp_path):
     assert store.participants("room") == [
         {"id": "participant-id", "room": "room", "name": "plan"}
     ]
+    assert store.pending("participant-id")["text"] == "kept"
     assert store.db.execute("SELECT 1 FROM rooms WHERE name='room'").fetchone() is not None
     waiter_columns = {
         row["name"] for row in store.db.execute("PRAGMA table_info(waiter_runs)")
     }
     assert {"pid", "heartbeat_at", "exit_kind", "last_error"} <= waiter_columns
-    assert store.db.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='waiter_requests'"
-    ).fetchone() is not None
+    request_columns = [
+        row["name"] for row in store.db.execute("PRAGMA table_info(waiter_requests)")
+    ]
+    assert request_columns == ["token", "codex_thread", "requested_at"]
+    assert store.take_waiter_request("session-token") == {
+        "codex_thread": "thread-7", "requested_at": 5
+    }
     store.close()
 
 
@@ -211,19 +230,18 @@ def test_stale_registered_roles_are_reported_offline(tmp_path):
         {"name": "research", "connection": "offline", "waiter": "offline"},
         {"name": "write", "connection": "offline", "waiter": "offline"},
     ]
-    store.waiter_finished(active_run, "normal", 0, "test complete")
+    store.waiter_finished("active-token", "normal", 0, "test complete")
+    assert store.last_waiter(active["id"], "active-token")["id"] == active_run
     store.close()
 
 
-def _waiter_command(db: Path, participant_id: str, token: str):
+def _waiter_command(db: Path, token: str):
     return [
         sys.executable,
         "-m",
         "agent_channel_mcp.waiter",
         "--db",
         str(db),
-        "--participant",
-        participant_id,
         "--token",
         token,
     ]
@@ -233,8 +251,8 @@ def _active(store: Store, participant: dict, token: str):
     store.activate(participant["id"], token)
 
 
-def _stop_waiter(process: subprocess.Popen, store: Store, participant: dict, token: str):
-    store.deactivate(participant["id"], token)
+def _stop_waiter(process: subprocess.Popen, store: Store, token: str):
+    store.deactivate(token)
     try:
         process.wait(timeout=2)
     except subprocess.TimeoutExpired:
@@ -266,7 +284,7 @@ def test_waiter_delivers_text_and_acks_after_stdout_success(tmp_path):
     token = "session-token"
     _active(store, receiver, token)
     process = subprocess.Popen(
-        _waiter_command(db, receiver["id"], token),
+        _waiter_command(db, token),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -280,11 +298,11 @@ def test_waiter_delivers_text_and_acks_after_stdout_success(tmp_path):
         header = process.stdout.readline()
         body = process.stdout.readline()
         selector.close()
-        assert header == f"{message_id} sender\n"
+        assert header == f"{message_id} room sender\n"
         assert body == "hello\n"
         wait_for(lambda: store.pending(receiver["id"]) is None)
     finally:
-        _stop_waiter(process, store, receiver, token)
+        _stop_waiter(process, store, token)
         store.close()
 
 
@@ -298,7 +316,7 @@ def test_waiter_preserves_pending_when_stdout_is_unwritable(tmp_path):
     _active(store, receiver, token)
     with open(os.devnull, "w", encoding="utf-8") as stdin, open("/dev/full", "w") as full:
         process = subprocess.Popen(
-            _waiter_command(db, receiver["id"], token), stdin=stdin, stdout=full, stderr=subprocess.PIPE, text=True
+            _waiter_command(db, token), stdin=stdin, stdout=full, stderr=subprocess.PIPE, text=True
         )
         wait_for(lambda: process.poll() is not None)
     assert store.pending(receiver["id"]) is not None
@@ -320,7 +338,7 @@ def test_waiter_retries_failed_codex_queue_without_ack(tmp_path):
     environment = os.environ.copy()
     environment["PATH"] = f"{bin_dir}{os.pathsep}{environment['PATH']}"
     environment["CODEX_ARGS_LOG"] = str(log)
-    process = subprocess.Popen(_waiter_command(db, receiver["id"], token) + ["--codex", "thread-42"], env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    process = subprocess.Popen(_waiter_command(db, token) + ["--codex", "thread-42"], env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     wait_for(lambda: log.exists() and len(log.read_text(encoding="utf-8").splitlines()) > 0)
     time.sleep(0.1)
     assert store.pending(receiver["id"]) is not None
@@ -330,7 +348,7 @@ def test_waiter_retries_failed_codex_queue_without_ack(tmp_path):
         f"codex queue exited 7 for message {store.pending(receiver['id'])['id']}"
     )
     assert run["ended_at"] is None
-    _stop_waiter(process, store, receiver, token)
+    _stop_waiter(process, store, token)
     store.close()
 
 
@@ -351,7 +369,7 @@ def test_waiter_codex_queue_acks_and_preserves_message_argument(tmp_path):
     environment["PATH"] = f"{bin_dir}{os.pathsep}{environment['PATH']}"
     environment["CODEX_ARGS_LOG"] = str(log)
     process = subprocess.Popen(
-        _waiter_command(db, receiver["id"], token) + ["--codex", "thread-42"],
+        _waiter_command(db, token) + ["--codex", "thread-42"],
         env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     try:
@@ -359,11 +377,11 @@ def test_waiter_codex_queue_acks_and_preserves_message_argument(tmp_path):
         args = log.read_bytes().split(b"\0")[:-1]
         assert b"thread-42" in args
         delivered = args[args.index(b"--message") + 1].decode()
-        assert delivered == f"{message_id} sender\n{text}"
+        assert delivered == f"{message_id} room sender\n{text}"
         assert not (tmp_path / "pwned").exists()
         assert message_id > 0
     finally:
-        _stop_waiter(process, store, receiver, token)
+        _stop_waiter(process, store, token)
         store.close()
 
 
@@ -377,8 +395,8 @@ def test_waiter_codex_queue_acks_and_preserves_message_argument(tmp_path):
     ("😀" * 251, "😀" * 250 + "\n😀"),
 ])
 def test_forced_wrap_preserves_text_and_existing_newlines(body, expected):
-    actual = render_message({"id": 42, "sender": "claude", "text": body})
-    assert actual == "42 claude\n" + expected
+    actual = render_message({"id": 42, "room": "room", "sender": "claude", "text": body})
+    assert actual == "42 room claude\n" + expected
     assert all(len(line.encode("utf-16-le")) <= 1000 for line in actual.split("\n"))
 
 
@@ -389,22 +407,22 @@ def test_only_one_waiter_holds_participant_lock(tmp_path):
     receiver = store.participant("room", "receiver")
     token = "session-token"
     _active(store, receiver, token)
-    first = subprocess.Popen(_waiter_command(db, receiver["id"], token), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    first = subprocess.Popen(_waiter_command(db, token), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     selector = selectors.DefaultSelector()
     try:
         message_id = send_one(store, sender["id"], receiver["name"], "lock held")
         selector.register(first.stdout, selectors.EVENT_READ)
         assert selector.select(timeout=3)
-        assert first.stdout.readline() == f"{message_id} sender\n"
+        assert first.stdout.readline() == f"{message_id} room sender\n"
         assert first.stdout.readline() == "lock held\n"
-        second = subprocess.run(_waiter_command(db, receiver["id"], token), capture_output=True,
+        second = subprocess.run(_waiter_command(db, token), capture_output=True,
                                 text=True, timeout=3)
         assert second.returncode != 0
         assert "Already running" in second.stderr
         assert first.poll() is None
     finally:
         selector.close()
-        _stop_waiter(first, store, receiver, token)
+        _stop_waiter(first, store, token)
         store.close()
 
 
@@ -417,29 +435,30 @@ def test_new_session_waiter_takes_over_after_token_change(tmp_path):
     new_token = "new-session-token"
     _active(store, receiver, old_token)
     old = subprocess.Popen(
-        _waiter_command(db, receiver["id"], old_token),
+        _waiter_command(db, old_token),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
     new = None
-    lock_path = db.with_name(f"{db.name}.{receiver['id']}.wait.lock")
+    old_lock = db.with_name(f"{db.name}.{old_token}.wait.lock")
+    new_lock = db.with_name(f"{db.name}.{new_token}.wait.lock")
     try:
-        wait_for(lambda: lock_path.exists() and lock_path.read_text() == old_token)
+        wait_for(lambda: old_lock.exists() and old_lock.read_text() == old_token)
         _active(store, receiver, new_token)
         new = subprocess.Popen(
-            _waiter_command(db, receiver["id"], new_token),
+            _waiter_command(db, new_token),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
         wait_for(lambda: old.poll() is not None)
-        wait_for(lambda: lock_path.read_text() == new_token)
+        wait_for(lambda: new_lock.exists() and new_lock.read_text() == new_token)
         message_id = send_one(store, sender["id"], receiver["name"], "after takeover")
         selector = selectors.DefaultSelector()
         selector.register(new.stdout, selectors.EVENT_READ)
         assert selector.select(timeout=3)
-        assert new.stdout.readline() == f"{message_id} sender\n"
+        assert new.stdout.readline() == f"{message_id} room sender\n"
         assert new.stdout.readline() == "after takeover\n"
         selector.close()
     finally:
@@ -447,7 +466,7 @@ def test_new_session_waiter_takes_over_after_token_change(tmp_path):
             old.terminate()
             old.wait(timeout=2)
         if new is not None:
-            _stop_waiter(new, store, receiver, new_token)
+            _stop_waiter(new, store, new_token)
         if old.stdout:
             old.stdout.close()
         if old.stderr:
@@ -460,7 +479,7 @@ def test_waiter_records_signal_exit_and_join_reports_abrupt_loss(tmp_path):
     joined = channel.join("room", "plan")
     participant = joined["participant"]
     process = subprocess.Popen(
-        _waiter_command(channel.store.path, participant["id"], channel.token),
+        _waiter_command(channel.store.path, channel.token),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -479,7 +498,7 @@ def test_waiter_records_signal_exit_and_join_reports_abrupt_loss(tmp_path):
         assert signaled["waiter_detail"]["exit_kind"] == "signal"
 
         replacement = subprocess.Popen(
-            _waiter_command(channel.store.path, participant["id"], channel.token),
+            _waiter_command(channel.store.path, channel.token),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -533,7 +552,7 @@ def test_mcp_managed_codex_waiter_outlives_launcher_and_delivers(
     token = channel.token
     try:
         launcher = subprocess.run(
-            _waiter_command(db, receiver["id"], token)
+            _waiter_command(db, token)
             + ["--register", "--codex", "thread-42"],
             env=os.environ.copy(),
             capture_output=True,
@@ -551,10 +570,10 @@ def test_mcp_managed_codex_waiter_outlives_launcher_and_delivers(
         wait_for(lambda: channel.store.pending(receiver["id"]) is None)
         args = log.read_bytes().split(b"\0")[:-1]
         assert args[args.index(b"--message") + 1] == (
-            f"{message_id} sender\nmanaged".encode()
+            f"{message_id} room sender\nmanaged".encode()
         )
     finally:
-        channel.store.deactivate(receiver["id"], token)
+        channel.store.deactivate(token)
         wait_for(
             lambda: (
                 channel.store.last_waiter(receiver["id"], token) is not None
