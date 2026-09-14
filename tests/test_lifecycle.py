@@ -396,7 +396,7 @@ def test_an_earlier_run_in_the_same_second_is_not_taken_for_this_attempt(tmp_pat
     runs_before = store.latest_run_id(token)
     channel.worker_failure = {"request_id": request_id, "runs_before": runs_before,
                               "detail": "ValueError: Already running", "at": time.monotonic() - 1}
-    channel._serve_request(store, token, request)
+    channel._serve_request(store, token, request, threading.Event())
     assert store.waiter_request(token)["request_id"] == request_id  # not taken as recorded
     assert channel.worker is not None                                # tried again instead
     wait_for(lambda: store.latest_run_id(token) > runs_before)       # and this one ran

@@ -31,6 +31,9 @@ class Channel:
         self.supervisor = None
         self.worker = None
         self.worker_stop = None
+        # Held while a worker is started and while the threads are told to stop, so
+        # that no worker starts unstopped after a close.
+        self.lifecycle = threading.Lock()
         self.connection_stop = None
         self.connection_thread = None
         # What a background thread died of, kept where join can show it.
@@ -316,7 +319,7 @@ class Channel:
                         store = Store(self.store.path)
                     request = store.waiter_request(token)
                     if request is not None:
-                        self._serve_request(store, token, request)
+                        self._serve_request(store, token, request, stop)
                     pause = 0.5
                     wait = 0.1
                 except sqlite3.Error as error:
@@ -331,7 +334,8 @@ class Channel:
             if store is not None:
                 store.close()
 
-    def _serve_request(self, store: Store, token: str, request: dict) -> None:
+    def _serve_request(self, store: Store, token: str, request: dict,
+                       stop: threading.Event) -> None:
         request_id = request["request_id"]
         run = store.last_waiter_for_token(token)
         if run is not None and run["ended_at"] is None and lock_owned(
@@ -358,15 +362,24 @@ class Channel:
                 return
             if time.monotonic() - failure["at"] < 0.5:
                 return
-        self.worker_stop = threading.Event()
-        self.worker = threading.Thread(
-            target=self._run_worker,
-            args=(token, request["codex_thread"], request_id, store.latest_run_id(token),
-                  self.worker_stop),
-            daemon=True,
-            name=f"agent-channel-waiter-{token}",
-        )
-        self.worker.start()
+        self._spawn_worker(token, request["codex_thread"], request_id,
+                           store.latest_run_id(token), stop)
+
+    def _spawn_worker(self, token: str, codex_thread: str, request_id: str,
+                      runs_before: int, stop: threading.Event) -> None:
+        # Under the lifecycle lock: a stop set before it is seen here, and one set
+        # after it finds the worker to stop. No worker starts unstopped after a close.
+        with self.lifecycle:
+            if stop.is_set():
+                return
+            self.worker_stop = threading.Event()
+            self.worker = threading.Thread(
+                target=self._run_worker,
+                args=(token, codex_thread, request_id, runs_before, self.worker_stop),
+                daemon=True,
+                name=f"agent-channel-waiter-{token}",
+            )
+            self.worker.start()
 
     def _run_worker(self, token: str, codex_thread: str, request_id: str,
                     runs_before: int, stop: threading.Event) -> None:
@@ -386,14 +399,15 @@ class Channel:
         # The worker is told to stop directly: it must not depend on a sign-off the
         # database may refuse. One still ending keeps its reference and is said on
         # stderr rather than forgotten alive.
-        if self.supervisor_stop is not None:
-            self.supervisor_stop.set()
+        with self.lifecycle:
+            if self.supervisor_stop is not None:
+                self.supervisor_stop.set()
+            if self.worker_stop is not None:
+                self.worker_stop.set()
         if self.supervisor is not None:
             self.supervisor.join(timeout=1)
         self.supervisor_stop = None
         self.supervisor = None
-        if self.worker_stop is not None:
-            self.worker_stop.set()
         if self.worker is not None:
             self.worker.join(timeout=3)
             if self.worker.is_alive():
