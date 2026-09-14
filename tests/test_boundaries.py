@@ -281,6 +281,97 @@ def test_a_waiter_signalled_during_a_queue_takes_the_queue_and_its_child_with_it
         store.close()
 
 
+# What a restarted waiter queues again, and what it cannot help queueing again.
+
+def _logging_codex(bin_dir: Path, after: str = "") -> None:
+    codex = bin_dir / "codex"
+    codex.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\0' \"$@\" >> \"$CODEX_ARGS_LOG\"\n"
+        f"{after}\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    codex.chmod(0o755)
+
+
+def _queued(log: Path) -> list[str]:
+    if not log.exists():
+        return []
+    args = log.read_bytes().split(b"\0")[:-1]
+    return [args[i + 1].decode().split("\n")[0] for i, arg in enumerate(args) if arg == b"--message"]
+
+
+def _waiter(db: Path, token: str) -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-m", "agent_channel_mcp.waiter", "--db", str(db), "--token", token,
+         "--codex", "thread-1"],
+        env=os.environ.copy(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+
+
+def test_a_restarted_waiter_queues_only_what_was_never_acknowledged(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "sink.log"
+    _logging_codex(bin_dir)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("CODEX_ARGS_LOG", str(log))
+    db = tmp_path / "db"
+    store = Store(db)
+    sender = store.participant("room", "plan")
+    receiver = store.participant("room", "exec")
+    store.activate(receiver["id"], "first-session")
+    first = store.send(sender["id"], "one", to="exec")[0]["message_id"]
+    second = store.send(sender["id"], "two", to="exec")[0]["message_id"]
+    waiter = _waiter(db, "first-session")
+    wait_for(lambda: store.pending(receiver["id"]) is None, timeout=10)
+    store.deactivate("first-session")                       # the session ends; the waiter follows
+    assert waiter.wait(timeout=10) == 0
+    third = store.send(sender["id"], "three", to="exec")[0]["message_id"]
+    store.activate(receiver["id"], "second-session")        # the same role, a new connection
+    waiter = _waiter(db, "second-session")
+    try:
+        wait_for(lambda: store.pending(receiver["id"]) is None, timeout=10)
+        time.sleep(1.0)                                     # long enough to queue again if it would
+        assert _queued(log) == [f"{first} room plan", f"{second} room plan", f"{third} room plan"]
+    finally:
+        store.deactivate("second-session")
+        waiter.wait(timeout=10)
+        store.close()
+
+
+def test_a_waiter_that_dies_after_the_queue_took_the_message_queues_it_again(tmp_path, monkeypatch):
+    """The limit of at-least-once: accepted by the sink, not yet acknowledged, so the
+    next waiter queues the same id once more. A sink that cannot take an id twice
+    would need to say so itself."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "sink.log"
+    _logging_codex(bin_dir, after="kill -9 $PPID")           # the waiter dies right after acceptance
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("CODEX_ARGS_LOG", str(log))
+    db = tmp_path / "db"
+    store = Store(db)
+    sender = store.participant("room", "plan")
+    receiver = store.participant("room", "exec")
+    store.activate(receiver["id"], "tok")
+    only = store.send(sender["id"], "once, twice", to="exec")[0]["message_id"]
+    waiter = _waiter(db, "tok")
+    assert waiter.wait(timeout=10) == -9
+    assert _queued(log) == [f"{only} room plan"]
+    assert store.pending(receiver["id"])["id"] == only        # accepted, never acknowledged
+    _logging_codex(bin_dir)                                   # the sink behaves from now on
+    waiter = _waiter(db, "tok")
+    try:
+        wait_for(lambda: store.pending(receiver["id"]) is None, timeout=10)
+        assert _queued(log) == [f"{only} room plan", f"{only} room plan"]
+    finally:
+        store.deactivate("tok")
+        waiter.wait(timeout=10)
+        store.close()
+
+
 # A queue that hangs with a child of its own.
 
 def test_a_timed_out_queue_takes_its_children_with_it(tmp_path, monkeypatch):
