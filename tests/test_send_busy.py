@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_channel_mcp.store import Store, _is_busy
+from agent_channel_mcp.store import Store, is_busy
 
 
 def _room(db: Path):
@@ -206,13 +206,13 @@ def test_busy_is_told_by_code_where_python_carries_one_and_by_message_otherwise(
             store.db.execute("BEGIN IMMEDIATE")
     finally:
         holder.wait(timeout=10)
-    assert _is_busy(raised.value)
+    assert is_busy(raised.value)
     if sys.version_info >= (3, 11):
         assert raised.value.sqlite_errorcode == 5
     # Python 3.10 has no sqlite_errorcode; a constructed error carries None on 3.11+.
     constructed = sqlite3.OperationalError("database is locked")
     assert getattr(constructed, "sqlite_errorcode", None) is None
-    assert _is_busy(constructed)
-    assert not _is_busy(sqlite3.OperationalError("database table is locked"))   # SQLITE_LOCKED
-    assert not _is_busy(sqlite3.OperationalError("no such table: messages"))
+    assert is_busy(constructed)
+    assert not is_busy(sqlite3.OperationalError("database table is locked"))   # SQLITE_LOCKED
+    assert not is_busy(sqlite3.OperationalError("no such table: messages"))
     store.close()

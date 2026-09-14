@@ -223,7 +223,7 @@ def test_last_leave_and_full_takeover_issue_a_fresh_token(tmp_path):
         assert agent.join("r4", "exec", "claude-code")["rooms"] == ["r4"]
         assert agent.token != second_token and agent.script != second_script
         assert not second_script.exists()
-        assert agent.store.take_waiter_request(second_token) is None
+        assert agent.store.waiter_request(second_token) is None
         assert agent.store.token_active(agent.token)
     finally:
         agent.close()
