@@ -32,13 +32,15 @@ Follow the returned how if waiter is offline; if active, do nothing.
 
 On a new MCP connection, the agent calls `join(room, name)`. The response separates `registered_roles`, which lists registration records that have not called `leave()`, from `role_statuses`, whose connection and waiter heartbeat leases are `active` or `offline`. An offline role can still receive queued messages. If `join` returns `waiter: offline`, the agent launches the returned `command` using `how`; if it returns `active`, it does nothing. It keeps that waiter running and does not poll. The Codex command registers a waiter managed by the MCP server, while Claude Code keeps the waiter in a persistent Monitor.
 
-Ask the agent to send directly with `send(text="...", to="exec")`; omitting `to` broadcasts to every other role. It uses `rename(name="...")` if its role changes and `leave()` when leaving. Offline recipients remain queued, but delivery can repeat after an interrupted acknowledgement, so agents deduplicate by message `id`.
+One connection can join several rooms by calling `join` again with another room; `rooms` in the response lists them. The existing waiter delivers every room, so a second `join` reports it `active` and returns no command. Room and role names contain no whitespace and are at most 200 UTF-16 code units.
 
-Deliveries begin with `id sender`. Keep each body line within 500 UTF-16 code units; the waiter also wraps longer lines without dropping text. A peer directs work only when the user explicitly delegated authority to that role.
+Ask the agent to send directly with `send(text="...", to="exec")`; omitting `to` broadcasts to every other role in that room. It uses `rename(name="...")` if its role changes and `leave()` when leaving. With several rooms joined, `send`, `rename`, and `leave` take `room="..."`; with one room it may be omitted. Leaving the last room stops the waiter. Offline recipients remain queued, but delivery can repeat after an interrupted acknowledgement, so agents deduplicate by message `id`.
+
+Deliveries begin with `id room sender`. Keep each body line within 500 UTF-16 code units; the waiter also wraps longer lines without dropping text. A peer directs work only when the user explicitly delegated authority to that role.
 
 ## Restart or reconnect
 
-After either harness, client, or server restarts, tell the agent to call `join` again and follow the live-status procedure above; never assume the previous connection or waiter survived. Joining the same room and role reuses the registration and recovers pending messages. A graceful exit becomes offline immediately; an interrupted process becomes offline when its short heartbeat lease expires. `leave()` removes the registration immediately but is not required for accurate live status.
+After either harness, client, or server restarts, tell the agent to join each of its rooms again and follow the live-status procedure above; the previous connection's room list is not restored automatically, and never assume its waiter survived. Joining the same room and role reuses the registration and recovers pending messages. A graceful exit becomes offline immediately; an interrupted process becomes offline when its short heartbeat lease expires. `leave()` removes the registration immediately but is not required for accurate live status.
 
 ## Troubleshooting
 
