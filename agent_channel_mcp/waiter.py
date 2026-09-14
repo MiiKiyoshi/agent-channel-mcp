@@ -89,15 +89,19 @@ def run(db: Path, token: str, codex_thread: str | None = None) -> int:
                         if codex_thread is None:
                             print(text, flush=True)
                         else:
+                            # In a session of its own, so a timeout takes its children too.
+                            queue = subprocess.Popen(
+                                ["codex", "queue", "--thread", codex_thread, "--message", text],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                start_new_session=True,
+                            )
                             try:
-                                result = subprocess.run(
-                                    ["codex", "queue", "--thread", codex_thread, "--message", text],
-                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                    timeout=CODEX_QUEUE_TIMEOUT_SECONDS,
-                                )
-                                failed = f"exited {result.returncode}" if result.returncode else None
+                                code = queue.wait(timeout=CODEX_QUEUE_TIMEOUT_SECONDS)
+                                failed = f"exited {code}" if code else None
                             except subprocess.TimeoutExpired:
                                 # Killed at the timeout; not acknowledged, so it is tried again.
+                                os.killpg(queue.pid, signal.SIGKILL)
+                                queue.wait()
                                 failed = f"timed out after {CODEX_QUEUE_TIMEOUT_SECONDS} s"
                             if failed is not None:
                                 detail = f"codex queue {failed} for message {message['id']}"
