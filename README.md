@@ -20,11 +20,12 @@ Reconnect MCP in both harnesses after registration. See the [Codex MCP documenta
 
 ## Create a room and invite the other agent
 
-Choose a conversation-specific room name and short roles such as `plan`, `exec`, or `review`. Paste this template into each harness with that agent's role:
+Ask your agent to create a room and write an invitation. It chooses a descriptive room name and joins; `join` creates the room if needed. Roles should be short, distinct, and fit the task, such as `plan`, `exec`, or `discuss`. The invitation is text to paste into the other harness:
 
 ```text
-Join agent-channel room "<room>" as "<role>".
-Call join(room="<room>", name="<role>") and follow its waiter instructions.
+Purpose: <discussion or task>.
+Call agent-channel join(room="<room>", name="<peer role>").
+Follow the returned how if waiter is offline; if active, do nothing.
 ```
 
 ## Join, wait, and send

@@ -218,20 +218,28 @@ def test_abrupt_client_exit_becomes_offline_after_connection_lease(tmp_path):
 def test_instructions_lead_from_join_to_waiter_command(tmp_path):
     channel = Channel(tmp_path / "db")
     try:
-        instructions = create_server(channel).instructions
+        server = create_server(channel)
+        instructions = server.instructions
+        descriptions = {tool.name: tool.description for tool in asyncio.run(server.list_tools())}
+        join = descriptions["join"]
         assert "only across different session systems" in instructions
         assert "same-system sessions use native communication" in instructions
-        assert "ask before creating one" in instructions
-        assert "copyable invitation" in instructions
+        assert "Join or create a room" in join
+        assert "When asked to create one, choose a descriptive room name" in join
+        assert "otherwise ask before creating" in join
+        assert "copyable invitation, not a code/link" in join
+        assert 'join(room="...", name="<peer role>")' in join
+        assert "short, distinct roles suited" in join
+        assert "discuss" in join
         assert "waiter=offline, start command using how" in instructions
-        assert "registered_roles lists registration records" in instructions
-        assert "participant lock rejects duplicate" in instructions
+        assert "registered_roles (not left)" in join
+        assert "Do not poll or start duplicate waiters" in instructions
         assert "Do not poll" in instructions
-        assert "takes ownership" in instructions
-        assert "shortest clear role name" in instructions
-        assert "omit to to broadcast" in instructions
-        for kept in ("500 characters", "'id sender'", "explicitly delegated",
-                     "does not expand authorization", "Reply only when needed"):
+        assert "takes ownership" in join
+        assert "omit to to broadcast" in descriptions["send"]
+        assert "copyable invitation" not in instructions
+        for kept in ("500 UTF-16 code units", "'id sender'", "deduplicate by id",
+                     "explicitly delegated authority", "Reply only when needed"):
             assert kept in instructions
         joined = channel.join("room", "claude")
         assert joined["next"].startswith("If waiter is offline, start command using how")
