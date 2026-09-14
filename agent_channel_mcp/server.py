@@ -1,5 +1,7 @@
 import argparse
+import os
 import shlex
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -9,8 +11,12 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from .store import HEARTBEAT_INTERVAL_SECONDS, PRESENCE_LEASE_SECONDS, Store
-from .waiter import run as run_waiter
+from .store import HEARTBEAT_INTERVAL_SECONDS, PRESENCE_LEASE_SECONDS, Store, is_busy
+from .waiter import lock_owned, lock_path, run as run_waiter
+
+# A requested waiter is tried again until this long after the request; register()
+# gives up two seconds later, so the cause of a failed start reaches it first.
+WAITER_START_WINDOW_SECONDS = 10
 
 
 class Channel:
@@ -26,6 +32,10 @@ class Channel:
         self.worker = None
         self.connection_stop = None
         self.connection_thread = None
+        # What a background thread died of, kept where join can show it.
+        self.connection_failure = None
+        self.supervisor_failure = None
+        self.worker_failure = None
 
     def join(self, room: str, name: str, client_name: str = "other",
              policy: str | None = None) -> dict:
@@ -45,7 +55,7 @@ class Channel:
         self._start_connection_heartbeat()
         if policy is not None:
             self.store.set_policy(room, policy)
-        return {
+        result = {
             "participant": self.identities[room],
             "rooms": sorted(self._owned_rooms()),
             "policy": self.store.policy(room),
@@ -53,6 +63,15 @@ class Channel:
             "role_statuses": self.store.role_statuses(room),
             **self._waiting(room, client_name),
         }
+        failures = {
+            name: failure for name, failure in (
+                ("connection", self.connection_failure),
+                ("supervisor", self.supervisor_failure),
+            ) if failure is not None
+        }
+        if failures:
+            result["thread_failures"] = failures
+        return result
 
     def _owned_rooms(self) -> list[str]:
         return [
@@ -192,17 +211,36 @@ class Channel:
         self.connection_thread.start()
 
     def _heartbeat_connection(self, token: str, stop: threading.Event) -> None:
+        # The database may be taken for longer than a connection waits, from opening
+        # this thread's own connection onward. A busy error is waited out, longer each
+        # time, and the beat resumes; any other error ends the thread and is kept for
+        # join to show. What the beat cannot do while shut out is stay visible: the
+        # lease may lapse and the role read offline until it resumes.
         if stop.wait(HEARTBEAT_INTERVAL_SECONDS):
             return
-        store = Store(self.store.path)
+        self.connection_failure = None
+        store = None
+        pause = 0.5
         try:
             while True:
-                if not store.connection_heartbeat(token):
-                    break
-                if stop.wait(HEARTBEAT_INTERVAL_SECONDS):
+                try:
+                    if store is None:
+                        store = Store(self.store.path)
+                    if not store.connection_heartbeat(token):
+                        break
+                    pause = 0.5
+                    wait = HEARTBEAT_INTERVAL_SECONDS
+                except sqlite3.Error as error:
+                    if not is_busy(error):
+                        self.connection_failure = f"{type(error).__name__}: {error}"
+                        print(f"Connection heartbeat stopped: {error}", file=sys.stderr, flush=True)
+                        break
+                    wait, pause = pause, min(pause * 2, HEARTBEAT_INTERVAL_SECONDS)
+                if stop.wait(wait):
                     break
         finally:
-            store.close()
+            if store is not None:
+                store.close()
 
     def _stop_connection_heartbeat(self) -> None:
         if self.connection_stop is not None:
@@ -264,29 +302,80 @@ class Channel:
         self.supervisor.start()
 
     def _supervise(self, token: str, stop: threading.Event) -> None:
-        store = Store(self.store.path)
+        # A busy database is waited out as in the heartbeat thread; any other error
+        # ends the thread and is kept for join. The request is left in place until the
+        # waiter it asks for has its run row, or its start has failed for good.
+        self.supervisor_failure = None
+        store = None
+        pause = 0.5
         try:
             while not stop.is_set():
-                request = store.take_waiter_request(token)
-                if request is not None and (
-                    self.worker is None or not self.worker.is_alive()
-                ):
-                    self.worker = threading.Thread(
-                        target=self._run_worker,
-                        args=(token, request["codex_thread"]),
-                        daemon=True,
-                        name=f"agent-channel-waiter-{token}",
-                    )
-                    self.worker.start()
-                stop.wait(0.1)
+                try:
+                    if store is None:
+                        store = Store(self.store.path)
+                    request = store.waiter_request(token)
+                    if request is not None:
+                        self._serve_request(store, token, request)
+                    pause = 0.5
+                    wait = 0.1
+                except sqlite3.Error as error:
+                    if not is_busy(error):
+                        self.supervisor_failure = f"{type(error).__name__}: {error}"
+                        print(f"Waiter supervisor stopped: {error}", file=sys.stderr, flush=True)
+                        break
+                    wait, pause = pause, min(pause * 2, HEARTBEAT_INTERVAL_SECONDS)
+                if stop.wait(wait):
+                    break
         finally:
-            store.close()
+            if store is not None:
+                store.close()
 
-    def _run_worker(self, token: str, codex_thread: str) -> None:
+    def _serve_request(self, store: Store, token: str, request: dict) -> None:
+        requested_at = request["requested_at"]
+        run = store.last_waiter_for_token(token)
+        if run is not None and run["ended_at"] is None and lock_owned(
+            lock_path(store.path, token), token
+        ):
+            # A waiter of this connection is running, this thread's or an earlier one's.
+            store.finish_waiter_request(token, requested_at)
+            self.worker_failure = None
+            return
+        if self.worker is not None and self.worker.is_alive():
+            return
+        failure = self.worker_failure
+        if failure is not None and failure["requested_at"] == requested_at:
+            if run is not None and run["started_at"] >= requested_at:
+                # It got as far as its run row, and that row carries the failure.
+                store.finish_waiter_request(token, requested_at)
+                return
+            if time.time() - requested_at >= WAITER_START_WINDOW_SECONDS:
+                # Tried for as long as register() waits: the cause goes on record now,
+                # or on the next pass if the database is busy for this write too.
+                store.waiter_start_failed(token, os.getpid(), failure["detail"])
+                store.finish_waiter_request(token, requested_at)
+                self.worker_failure = None
+                return
+            if time.monotonic() - failure["at"] < 0.5:
+                return
+        self.worker = threading.Thread(
+            target=self._run_worker,
+            args=(token, request["codex_thread"], requested_at),
+            daemon=True,
+            name=f"agent-channel-waiter-{token}",
+        )
+        self.worker.start()
+
+    def _run_worker(self, token: str, codex_thread: str, requested_at: int) -> None:
+        # A failure is kept here and said on stderr: while the database is busy it
+        # cannot be written, and the supervisor records it once it can.
         try:
             run_waiter(self.store.path, token, codex_thread)
-        except Exception:
-            pass
+            self.worker_failure = None
+        except Exception as error:
+            detail = f"{type(error).__name__}: {error}"
+            self.worker_failure = {"requested_at": requested_at, "detail": detail,
+                                   "at": time.monotonic()}
+            print(f"Waiter did not run: {detail}", file=sys.stderr, flush=True)
 
     def _stop_supervisor(self) -> None:
         if self.supervisor_stop is not None:

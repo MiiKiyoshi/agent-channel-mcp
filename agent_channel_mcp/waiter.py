@@ -11,7 +11,10 @@ import sys
 import time
 from pathlib import Path
 
-from .store import Store
+from .store import Store, is_busy
+
+# A codex queue that hangs is killed after this long and the message stays unacknowledged.
+CODEX_QUEUE_TIMEOUT_SECONDS = 60
 
 
 class WaiterSignal(Exception):
@@ -86,12 +89,18 @@ def run(db: Path, token: str, codex_thread: str | None = None) -> int:
                         if codex_thread is None:
                             print(text, flush=True)
                         else:
-                            result = subprocess.run(
-                                ["codex", "queue", "--thread", codex_thread, "--message", text],
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                            )
-                            if result.returncode:
-                                detail = f"codex queue exited {result.returncode} for message {message['id']}"
+                            try:
+                                result = subprocess.run(
+                                    ["codex", "queue", "--thread", codex_thread, "--message", text],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    timeout=CODEX_QUEUE_TIMEOUT_SECONDS,
+                                )
+                                failed = f"exited {result.returncode}" if result.returncode else None
+                            except subprocess.TimeoutExpired:
+                                # Killed at the timeout; not acknowledged, so it is tried again.
+                                failed = f"timed out after {CODEX_QUEUE_TIMEOUT_SECONDS} s"
+                            if failed is not None:
+                                detail = f"codex queue {failed} for message {message['id']}"
                                 store.waiter_error(token, detail)
                                 if detail != reported_error:
                                     print(
@@ -108,6 +117,9 @@ def run(db: Path, token: str, codex_thread: str | None = None) -> int:
                     except sqlite3.OperationalError as error:
                         # Another process holds the database. Keep serving; a message
                         # delivered before a busy ack is repeated and deduplicated by id.
+                        # Any other database error ends the waiter with its cause on record.
+                        if not is_busy(error):
+                            raise
                         detail = f"{type(error).__name__}: {error}"
                         if detail != reported_error:
                             print(f"Database busy ({error}); retrying", file=sys.stderr, flush=True)
@@ -127,7 +139,7 @@ def run(db: Path, token: str, codex_thread: str | None = None) -> int:
         store.close()
 
 
-def _lock_owned(path: Path, owner: str) -> bool:
+def lock_owned(path: Path, owner: str) -> bool:
     try:
         handle = path.open("r+")
     except FileNotFoundError:
@@ -154,7 +166,7 @@ def register(args: argparse.Namespace) -> int:
             # The lock is taken first and the run row written right after it; join
             # reports active only from the row, so wait for both.
             run = store.last_waiter_for_token(args.token)
-            return _lock_owned(owned, args.token) and run is not None and run["ended_at"] is None
+            return lock_owned(owned, args.token) and run is not None and run["ended_at"] is None
 
         if running():
             return 0

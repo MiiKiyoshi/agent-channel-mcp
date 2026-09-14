@@ -9,7 +9,7 @@ HEARTBEAT_INTERVAL_SECONDS = 5
 PRESENCE_LEASE_SECONDS = 15
 
 
-def _is_busy(error: sqlite3.OperationalError) -> bool:
+def is_busy(error: sqlite3.Error) -> bool:
     """SQLITE_BUSY and its extended codes (BUSY_SNAPSHOT, BUSY_RECOVERY): another
     connection holds the database for now. Python 3.11 carries the code on the
     error; 3.10 leaves only SQLite's fixed message for that code."""
@@ -240,7 +240,7 @@ class Store:
                 try:
                     return self._send_once(sender_id, text, to)
                 except sqlite3.OperationalError as error:
-                    if not _is_busy(error):
+                    if not is_busy(error):
                         raise
                     remaining = self.SEND_DEADLINE_SECONDS - (time.monotonic() - started)
                     if remaining < pause + self.SEND_BUSY_TIMEOUT_SECONDS:
@@ -491,14 +491,34 @@ class Store:
                 (token, codex_thread, int(time.time())),
             )
 
-    def take_waiter_request(self, token: str) -> dict | None:
-        with self.db:
-            row = self.db.execute(
-                "SELECT codex_thread, requested_at FROM waiter_requests WHERE token=?", (token,)
-            ).fetchone()
-            if row is not None:
-                self.db.execute("DELETE FROM waiter_requests WHERE token=?", (token,))
+    def waiter_request(self, token: str) -> dict | None:
+        """The pending request, left in place until the waiter it asks for has started
+        or the start has failed for good."""
+        row = self.db.execute(
+            "SELECT codex_thread, requested_at FROM waiter_requests WHERE token=?", (token,)
+        ).fetchone()
         return dict(row) if row is not None else None
+
+    def finish_waiter_request(self, token: str, requested_at: int) -> None:
+        """Remove that request and not a newer one made since."""
+        with self.db:
+            self.db.execute(
+                "DELETE FROM waiter_requests WHERE token=? AND requested_at=?",
+                (token, requested_at),
+            )
+
+    def waiter_start_failed(self, token: str, pid: int, detail: str) -> None:
+        """A waiter that never got as far as its run row: a closed row for each room
+        of the connection, so join and register report the cause."""
+        now = int(time.time())
+        with self.db:
+            for participant_id in self.token_participants(token):
+                self.db.execute(
+                    "INSERT INTO waiter_runs(participant_id, token, pid, started_at, "
+                    "heartbeat_at, ended_at, exit_kind, exit_code, detail) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'error', 1, ?)",
+                    (participant_id, token, pid, now, now, now, detail),
+                )
 
     def cancel_waiter_request(self, token: str) -> None:
         with self.db:
