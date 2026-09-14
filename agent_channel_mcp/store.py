@@ -9,7 +9,20 @@ HEARTBEAT_INTERVAL_SECONDS = 5
 PRESENCE_LEASE_SECONDS = 15
 
 
+def _is_busy(error: sqlite3.OperationalError) -> bool:
+    """SQLITE_BUSY and its extended codes (BUSY_SNAPSHOT, BUSY_RECOVERY): another
+    connection holds the database for now. Python 3.11 carries the code on the
+    error; 3.10 leaves only SQLite's fixed message for that code."""
+    code = getattr(error, "sqlite_errorcode", None)
+    if code is not None:
+        return code & 0xFF == 5   # SQLITE_BUSY
+    return str(error) == "database is locked"
+
+
 class Store:
+    SEND_BUSY_TIMEOUT_SECONDS = 1.0
+    SEND_DEADLINE_SECONDS = 5.0
+
     def __init__(self, path: Path):
         self.path = path.expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -207,8 +220,36 @@ class Store:
     def send(self, sender_id: str, text: str, to: str | None = None) -> list[dict]:
         if not text.strip():
             raise ValueError("text must not be blank")
+        # Another process (a waiter acknowledging, another sender) may hold the write
+        # lock for a moment. Each attempt waits SEND_BUSY_TIMEOUT_SECONDS for it, then
+        # is rolled back whole and repeated after a short pause, until the deadline;
+        # every other error is raised as it comes. A message is inserted by exactly
+        # one committed attempt.
+        started = time.monotonic()
+        pause = 0.02
+        self.db.execute(f"PRAGMA busy_timeout = {int(self.SEND_BUSY_TIMEOUT_SECONDS * 1000)}")
+        try:
+            while True:
+                try:
+                    return self._send_once(sender_id, text, to)
+                except sqlite3.OperationalError as error:
+                    if not _is_busy(error):
+                        raise
+                    remaining = self.SEND_DEADLINE_SECONDS - (time.monotonic() - started)
+                    if remaining < pause + self.SEND_BUSY_TIMEOUT_SECONDS:
+                        raise
+                    time.sleep(pause)
+                    pause = min(pause * 2, 0.5)
+        finally:
+            self.db.execute("PRAGMA busy_timeout = 10000")
+
+    def _send_once(self, sender_id: str, text: str, to: str | None) -> list[dict]:
         now = int(time.time())
         with self.db:
+            # Take the write lock before reading, so the rows read and the rows
+            # written belong to one snapshot: no read that must later be promoted
+            # to a write past a commit another process made in between.
+            self.db.execute("BEGIN IMMEDIATE")
             sender = self.db.execute(
                 "SELECT room FROM participants WHERE id=? AND left_at IS NULL", (sender_id,)
             ).fetchone()
