@@ -20,8 +20,8 @@ def _is_busy(error: sqlite3.OperationalError) -> bool:
 
 
 class Store:
-    SEND_BUSY_TIMEOUT_SECONDS = 1.0
-    SEND_DEADLINE_SECONDS = 5.0
+    SEND_BUSY_TIMEOUT_SECONDS = 2.0
+    SEND_DEADLINE_SECONDS = 10.0
 
     def __init__(self, path: Path):
         self.path = path.expanduser().resolve()
@@ -32,6 +32,13 @@ class Store:
         self.db.execute("PRAGMA foreign_keys = ON")
         # Readers and the writer no longer block each other between processes.
         self.db.execute("PRAGMA journal_mode = WAL")
+        # A commit holds the one write lock until its fsync returns, and on a loaded
+        # disk that is seconds: with a heartbeat committed every few seconds by each
+        # server and waiter, the lock was held nearly all the time and a send found it
+        # taken for longer than any wait. In WAL mode NORMAL fsyncs at checkpoints
+        # instead, outside the write lock; a process crash loses nothing, only a power
+        # loss can drop the last commits, and a message channel can bear that.
+        self.db.execute("PRAGMA synchronous = NORMAL")
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self.db.execute(
