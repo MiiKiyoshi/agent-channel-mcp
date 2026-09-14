@@ -281,6 +281,48 @@ def test_a_waiter_signalled_during_a_queue_takes_the_queue_and_its_child_with_it
         store.close()
 
 
+def test_a_supervisor_delayed_before_starting_a_worker_starts_none_after_close(tmp_path, monkeypatch):
+    """The supervisor has decided to start a waiter and stalls just before doing so;
+    close runs meanwhile and the sign-off is refused. The stalled start must be refused
+    too, or a waiter no stop reaches would outlive the close."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "codex").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (bin_dir / "codex").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    db = tmp_path / "db"
+    channel = Channel(db)
+    channel.join("room", "exec", "codex")
+    token = channel.token
+    entered = threading.Event()
+    gate = threading.Event()
+    original = channel._spawn_worker
+
+    def delayed(*args, **kwargs):
+        entered.set()
+        gate.wait(10)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(channel, "_spawn_worker", delayed)
+    Store(db).request_waiter(token, "thread-1")
+    assert entered.wait(5)
+
+    def refused(token):
+        raise sqlite3.OperationalError("database is locked")
+
+    channel.store.deactivate = refused
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        channel.close()
+    checker = Store(db)
+    runs_before = checker.latest_run_id(token)
+    gate.set()
+    time.sleep(1.0)
+    assert not [t for t in threading.enumerate() if t.name.startswith("agent-channel-waiter")]
+    assert checker.latest_run_id(token) == runs_before          # nothing started after the close
+    assert channel.worker is None
+    checker.close()
+
+
 # What a restarted waiter queues again, and what it cannot help queueing again.
 
 def _logging_codex(bin_dir: Path, after: str = "") -> None:
