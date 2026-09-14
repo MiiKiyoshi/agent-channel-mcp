@@ -108,11 +108,11 @@ class Channel:
 
     def send(self, text: str, to: str | None = None, room: str | None = None) -> dict:
         _, identity = self._identity(room)
-        return {"deliveries": self.store.send(identity["id"], text, to)}
+        return {"deliveries": self.store.send(identity["id"], text, to, token=self.token)}
 
     def rename(self, name: str, room: str | None = None) -> dict:
         room, identity = self._identity(room)
-        self.identities[room] = self.store.rename(identity["id"], name)
+        self.identities[room] = self.store.rename(identity["id"], name, token=self.token)
         return {
             "participant": self.identities[room],
             "registered_roles": self.store.registered_roles(room),
@@ -391,13 +391,17 @@ class Channel:
         self.worker = None
 
     def close(self) -> None:
+        # The threads are stopped and the connection closed whatever the database
+        # says to the sign-off; a sign-off it refused leaves the role to its lease.
         self._stop_connection_heartbeat()
-        if self.token is not None:
-            self.store.deactivate(self.token)
         self._stop_supervisor()
-        if self.script is not None:
-            self.script.unlink(missing_ok=True)
-        self.store.close()
+        try:
+            if self.token is not None:
+                self.store.deactivate(self.token)
+        finally:
+            if self.script is not None:
+                self.script.unlink(missing_ok=True)
+            self.store.close()
 
 
 def create_server(channel: Channel) -> FastMCP:

@@ -27,20 +27,21 @@ class Store:
         self.path = path.expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.db = sqlite3.connect(self.path, timeout=10)
-        self.path.chmod(0o600)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA foreign_keys = ON")
-        # Readers and the writer no longer block each other between processes.
-        self.db.execute("PRAGMA journal_mode = WAL")
-        # A commit holds the one write lock until its fsync returns, and on a loaded
-        # disk that is seconds: with a heartbeat committed every few seconds by each
-        # server and waiter, the lock was held nearly all the time and a send found it
-        # taken for longer than any wait. In WAL mode NORMAL fsyncs at checkpoints
-        # instead, outside the write lock; a process crash loses nothing, only a power
-        # loss can drop the last commits, and a message channel can bear that.
-        self.db.execute("PRAGMA synchronous = NORMAL")
-        self.db.execute("BEGIN IMMEDIATE")
+        # Whatever fails from here on, the connection does not outlive the failure.
         try:
+            self.path.chmod(0o600)
+            self.db.row_factory = sqlite3.Row
+            self.db.execute("PRAGMA foreign_keys = ON")
+            # Readers and the writer no longer block each other between processes.
+            self.db.execute("PRAGMA journal_mode = WAL")
+            # A commit holds the one write lock until its fsync returns, and on a loaded
+            # disk that is seconds: with a heartbeat committed every few seconds by each
+            # server and waiter, the lock was held nearly all the time and a send found
+            # it taken for longer than any wait. In WAL mode NORMAL fsyncs at checkpoints
+            # instead, outside the write lock; a process crash loses nothing, only a
+            # power loss can drop the last commits, and a message channel can bear that.
+            self.db.execute("PRAGMA synchronous = NORMAL")
+            self.db.execute("BEGIN IMMEDIATE")
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS rooms "
                 "(name TEXT PRIMARY KEY, last_activity INTEGER NOT NULL)"
@@ -229,7 +230,11 @@ class Store:
             })
         return statuses
 
-    def send(self, sender_id: str, text: str, to: str | None = None) -> list[dict]:
+    def send(self, sender_id: str, text: str, to: str | None = None,
+             token: str | None = None) -> list[dict]:
+        """token, when given, must still own the sender inside the same transaction
+        as the write: a session taken over between its check and its write sends
+        nothing. Each attempt checks again."""
         if not text.strip():
             raise ValueError("text must not be blank")
         # Another process (a waiter acknowledging, another sender) may hold the write
@@ -243,7 +248,7 @@ class Store:
         try:
             while True:
                 try:
-                    return self._send_once(sender_id, text, to)
+                    return self._send_once(sender_id, text, to, token)
                 except sqlite3.OperationalError as error:
                     if not is_busy(error):
                         raise
@@ -255,7 +260,8 @@ class Store:
         finally:
             self.db.execute("PRAGMA busy_timeout = 10000")
 
-    def _send_once(self, sender_id: str, text: str, to: str | None) -> list[dict]:
+    def _send_once(self, sender_id: str, text: str, to: str | None,
+                   token: str | None) -> list[dict]:
         now = int(time.time())
         with self.db:
             # Take the write lock before reading, so the rows read and the rows
@@ -263,10 +269,13 @@ class Store:
             # to a write past a commit another process made in between.
             self.db.execute("BEGIN IMMEDIATE")
             sender = self.db.execute(
-                "SELECT room FROM participants WHERE id=? AND left_at IS NULL", (sender_id,)
+                "SELECT room, token FROM participants WHERE id=? AND left_at IS NULL",
+                (sender_id,),
             ).fetchone()
             if sender is None:
                 raise ValueError("Sender has left the room")
+            if token is not None and sender["token"] != token:
+                raise ValueError("This MCP session no longer owns its identity")
             if to is None:
                 recipients = self.db.execute(
                     "SELECT id, name FROM participants WHERE room=? AND id<>? "
@@ -292,16 +301,22 @@ class Store:
             self._touch(sender["room"], now)
             return deliveries
 
-    def rename(self, participant_id: str, name: str) -> dict:
+    def rename(self, participant_id: str, name: str, token: str | None = None) -> dict:
+        """token, when given, must still own the participant in the transaction that
+        renames it."""
         self._check_label("name", name)
         now = int(time.time())
         try:
             with self.db:
+                self.db.execute("BEGIN IMMEDIATE")
                 participant = self.db.execute(
-                    "SELECT room FROM participants WHERE id=? AND left_at IS NULL", (participant_id,)
+                    "SELECT room, token FROM participants WHERE id=? AND left_at IS NULL",
+                    (participant_id,),
                 ).fetchone()
                 if participant is None:
                     raise ValueError("Participant has left the room")
+                if token is not None and participant["token"] != token:
+                    raise ValueError("This MCP session no longer owns its identity")
                 self.db.execute("UPDATE participants SET name=? WHERE id=?", (name, participant_id))
                 self._touch(participant["room"], now)
         except sqlite3.IntegrityError:
@@ -313,6 +328,7 @@ class Store:
     def leave(self, participant_id: str, token: str) -> dict:
         now = int(time.time())
         with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
             participant = self.db.execute(
                 "SELECT id, room, name FROM participants "
                 "WHERE id=? AND token=? AND left_at IS NULL", (participant_id, token)
@@ -413,9 +429,18 @@ class Store:
             values += (token,)
         return [row["id"] for row in self.db.execute(query + " ORDER BY p.room", values)]
 
-    def waiter_started(self, participant_id: str, token: str | None, pid: int) -> int:
+    def waiter_started(self, participant_id: str, token: str | None, pid: int) -> int | None:
+        """Open this waiter's run for the participant, closing the runs before it.
+        A waiter whose token no longer owns the participant, taken over since it
+        read its rooms, opens nothing and closes nothing: None."""
         now = int(time.time())
         with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            owner = self.db.execute(
+                "SELECT token FROM participants WHERE id=? AND left_at IS NULL", (participant_id,)
+            ).fetchone()
+            if owner is None or (token is not None and owner["token"] != token):
+                return None
             self.db.execute(
                 "UPDATE waiter_runs SET ended_at=?, exit_kind='disappeared', "
                 "detail='lock was free when a replacement waiter started' "
