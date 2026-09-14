@@ -1,6 +1,7 @@
 """One connection in several rooms, served by one waiter."""
 
 import selectors
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -296,5 +297,45 @@ def test_room_and_name_reject_whitespace(tmp_path):
             store.rename(participant["id"], "x y")
         with pytest.raises(ValueError, match="1-200"):
             store.rename(participant["id"], "b" * 201)
+    finally:
+        store.close()
+
+
+def test_a_room_keeps_its_policy_and_join_always_reports_it(tmp_path):
+    db = tmp_path / "db"
+    first, second = Channel(db), Channel(db)
+    try:
+        assert first.join("r1", "plan")["policy"] is None          # a room with none says so
+        rules = "Report finished work or real blockers only.\nSend to one role; broadcast only notices."
+        assert first.join("r1", "plan", policy=rules)["policy"] == rules
+        assert second.join("r1", "exec")["policy"] == rules        # every joiner, no policy given
+        assert first.join("r2", "plan")["policy"] is None          # per room
+        assert first.join("r1", "plan", policy="  ")["policy"] is None   # blank clears
+        first.join("r1", "plan", policy=rules)
+    finally:
+        first.close()
+        second.close()
+    assert Channel(db).store.policy("r1") == rules                # durable across connections
+
+
+def test_policy_column_is_added_to_an_existing_store(tmp_path):
+    path = tmp_path / "db"
+    db = sqlite3.connect(path)
+    db.executescript("""
+        CREATE TABLE rooms (name TEXT PRIMARY KEY, last_activity INTEGER NOT NULL);
+        INSERT INTO rooms VALUES ('old', 1);
+        CREATE TABLE participants (
+            id TEXT PRIMARY KEY, room TEXT NOT NULL, name TEXT NOT NULL,
+            token TEXT, left_at INTEGER, UNIQUE(room, name)
+        );
+        INSERT INTO participants(id, room, name) VALUES ('p1', 'old', 'plan');
+    """)
+    db.close()
+    store = Store(path)
+    try:
+        assert store.policy("old") is None
+        assert store.registered_roles("old") == ["plan"]
+        store.set_policy("old", "rules")
+        assert store.policy("old") == "rules"
     finally:
         store.close()

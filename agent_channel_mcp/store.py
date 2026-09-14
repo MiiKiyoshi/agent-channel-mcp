@@ -72,6 +72,10 @@ class Store:
                 "CREATE INDEX IF NOT EXISTS waiter_history "
                 "ON waiter_runs(participant_id, id)"
             )
+            if "policy" not in {
+                row["name"] for row in self.db.execute("PRAGMA table_info(rooms)")
+            }:
+                self.db.execute("ALTER TABLE rooms ADD COLUMN policy TEXT")
             columns = {
                 row["name"] for row in self.db.execute("PRAGMA table_info(participants)")
             }
@@ -97,6 +101,17 @@ class Store:
             "ON CONFLICT(name) DO UPDATE SET last_activity=excluded.last_activity",
             (room, now),
         )
+
+    def set_policy(self, room: str, policy: str) -> None:
+        """Keep the room's standing rules; an empty text clears them."""
+        with self.db:
+            self._touch(room, int(time.time()))
+            self.db.execute("UPDATE rooms SET policy=? WHERE name=?",
+                            (policy.strip() or None, room))
+
+    def policy(self, room: str) -> str | None:
+        row = self.db.execute("SELECT policy FROM rooms WHERE name=?", (room,)).fetchone()
+        return None if row is None else row["policy"]
 
     def _collect_garbage(self, now: int) -> list[str]:
         cutoff = now - ROOM_TTL_SECONDS

@@ -234,7 +234,7 @@ def test_instructions_lead_from_join_to_waiter_command(tmp_path):
         assert "short, distinct, no whitespace" in join
         assert "discuss" in join
         assert "command/how only while waiter is offline" in join
-        assert len(join) <= 450
+        assert len(join) <= 500
         assert "waiter=offline, start command using how" in instructions
         assert "Do not poll or start duplicate waiters" in instructions
         assert "Do not poll" in instructions
