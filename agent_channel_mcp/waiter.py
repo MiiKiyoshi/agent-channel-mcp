@@ -172,7 +172,7 @@ def register(args: argparse.Namespace) -> int:
             return 0
         previous = store.last_waiter_for_token(args.token)
         previous_id = previous["id"] if previous is not None else 0
-        store.request_waiter(args.token, args.codex)
+        request_id = store.request_waiter(args.token, args.codex)
         deadline = time.monotonic() + 12
         while time.monotonic() < deadline:
             if running():
@@ -187,7 +187,7 @@ def register(args: argparse.Namespace) -> int:
                     f"MCP-managed waiter exited: {latest['detail'] or latest['exit_kind']}"
                 )
             time.sleep(0.05)
-        store.cancel_waiter_request(args.token)
+        store.cancel_waiter_request(args.token, request_id)
         raise TimeoutError("MCP server did not start the registered waiter")
     finally:
         store.close()

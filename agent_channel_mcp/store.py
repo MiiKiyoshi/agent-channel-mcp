@@ -67,7 +67,8 @@ class Store:
             )
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS waiter_requests ("
-                "token TEXT PRIMARY KEY, codex_thread TEXT NOT NULL, requested_at INTEGER NOT NULL)"
+                "token TEXT PRIMARY KEY, codex_thread TEXT NOT NULL, requested_at INTEGER NOT NULL, "
+                "request_id TEXT)"
             )
             request_columns = {
                 row["name"] for row in self.db.execute("PRAGMA table_info(waiter_requests)")
@@ -76,7 +77,8 @@ class Store:
                 # Requests were keyed by participant; one connection now holds one request.
                 self.db.execute(
                     "CREATE TABLE waiter_requests_by_token ("
-                    "token TEXT PRIMARY KEY, codex_thread TEXT NOT NULL, requested_at INTEGER NOT NULL)"
+                    "token TEXT PRIMARY KEY, codex_thread TEXT NOT NULL, requested_at INTEGER NOT NULL, "
+                    "request_id TEXT)"
                 )
                 self.db.execute(
                     "INSERT INTO waiter_requests_by_token(token, codex_thread, requested_at) "
@@ -84,6 +86,9 @@ class Store:
                 )
                 self.db.execute("DROP TABLE waiter_requests")
                 self.db.execute("ALTER TABLE waiter_requests_by_token RENAME TO waiter_requests")
+            elif "request_id" not in request_columns:
+                # A request is told from the next one by its own id, not by its second.
+                self.db.execute("ALTER TABLE waiter_requests ADD COLUMN request_id TEXT")
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS inbox "
                 "ON messages(recipient_id, acknowledged, id)"
@@ -478,34 +483,47 @@ class Store:
         ).fetchone()
         return dict(row) if row is not None else None
 
-    def request_waiter(self, token: str, codex_thread: str) -> None:
+    def request_waiter(self, token: str, codex_thread: str) -> str:
+        """Ask the server for a waiter; the id returned names this request alone."""
         if not codex_thread.strip():
             raise ValueError("Codex thread ID must not be blank")
+        request_id = uuid.uuid4().hex
         with self.db:
             if not self.token_active(token):
                 raise ValueError("This MCP session no longer owns its identity")
             self.db.execute(
-                "INSERT INTO waiter_requests(token, codex_thread, requested_at) "
-                "VALUES (?, ?, ?) ON CONFLICT(token) DO UPDATE SET "
-                "codex_thread=excluded.codex_thread, requested_at=excluded.requested_at",
-                (token, codex_thread, int(time.time())),
+                "INSERT INTO waiter_requests(token, codex_thread, requested_at, request_id) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(token) DO UPDATE SET "
+                "codex_thread=excluded.codex_thread, requested_at=excluded.requested_at, "
+                "request_id=excluded.request_id",
+                (token, codex_thread, int(time.time()), request_id),
             )
+        return request_id
 
     def waiter_request(self, token: str) -> dict | None:
         """The pending request, left in place until the waiter it asks for has started
         or the start has failed for good."""
         row = self.db.execute(
-            "SELECT codex_thread, requested_at FROM waiter_requests WHERE token=?", (token,)
+            "SELECT codex_thread, requested_at, request_id FROM waiter_requests WHERE token=?",
+            (token,),
         ).fetchone()
         return dict(row) if row is not None else None
 
-    def finish_waiter_request(self, token: str, requested_at: int) -> None:
+    def finish_waiter_request(self, token: str, request_id: str) -> None:
         """Remove that request and not a newer one made since."""
         with self.db:
             self.db.execute(
-                "DELETE FROM waiter_requests WHERE token=? AND requested_at=?",
-                (token, requested_at),
+                "DELETE FROM waiter_requests WHERE token=? AND request_id IS ?",
+                (token, request_id),
             )
+
+    def latest_run_id(self, token: str) -> int:
+        """The newest run row of this connection, 0 before any: a later row is a
+        later attempt, whatever second either was written in."""
+        row = self.db.execute(
+            "SELECT max(id) FROM waiter_runs WHERE token=?", (token,)
+        ).fetchone()
+        return row[0] or 0
 
     def waiter_start_failed(self, token: str, pid: int, detail: str) -> None:
         """A waiter that never got as far as its run row: a closed row for each room
@@ -520,9 +538,16 @@ class Store:
                     (participant_id, token, pid, now, now, now, detail),
                 )
 
-    def cancel_waiter_request(self, token: str) -> None:
+    def cancel_waiter_request(self, token: str, request_id: str | None = None) -> None:
+        """Withdraw the connection's request, or only the one named."""
         with self.db:
-            self.db.execute("DELETE FROM waiter_requests WHERE token=?", (token,))
+            if request_id is None:
+                self.db.execute("DELETE FROM waiter_requests WHERE token=?", (token,))
+            else:
+                self.db.execute(
+                    "DELETE FROM waiter_requests WHERE token=? AND request_id IS ?",
+                    (token, request_id),
+                )
 
     def close(self) -> None:
         self.db.close()

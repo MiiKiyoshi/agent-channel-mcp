@@ -196,9 +196,9 @@ def test_existing_database_is_migrated_without_losing_participants(tmp_path):
     request_columns = [
         row["name"] for row in store.db.execute("PRAGMA table_info(waiter_requests)")
     ]
-    assert request_columns == ["token", "codex_thread", "requested_at"]
+    assert request_columns == ["token", "codex_thread", "requested_at", "request_id"]
     assert store.waiter_request("session-token") == {
-        "codex_thread": "thread-7", "requested_at": 5
+        "codex_thread": "thread-7", "requested_at": 5, "request_id": None
     }
     store.close()
 
