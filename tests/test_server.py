@@ -229,8 +229,9 @@ def test_instructions_lead_from_join_to_waiter_command(tmp_path):
         assert "Join or create a room; call again to add rooms" in join
         assert "When asked to create one, choose a descriptive name" in join
         assert "otherwise ask before creating" in join
-        assert "Invitation (text, not a link)" in join
+        assert "Invitation (text, not a link): brief role purpose" in join
         assert 'join(room="...",' in join and 'name="<peer role>")' in join
+        assert "No detailed work context" in join
         assert "short, distinct, no whitespace" in join
         assert "discuss" in join
         assert "command/how only while waiter is offline" in join
@@ -238,6 +239,11 @@ def test_instructions_lead_from_join_to_waiter_command(tmp_path):
         assert "waiter=offline, start command using how" in instructions
         assert "Do not poll or start duplicate waiters" in instructions
         assert "Do not poll" in instructions
+        # The joiner is briefed by plan; what plan says still binds only by the user's word.
+        assert "After joining, send to the room's plan first" in instructions
+        assert "plan sends the current state, settled contracts, assets and your tasks" in instructions
+        assert instructions.index("send to the room's plan first") \
+            < instructions.index("explicitly delegated authority")
         assert "takes ownership" in join
         assert "omit to to broadcast" in descriptions["send"]
         assert "room is required when joined to more than one" in descriptions["send"]

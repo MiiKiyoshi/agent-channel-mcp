@@ -20,10 +20,10 @@ Reconnect MCP in both harnesses after registration. See the [Codex MCP documenta
 
 ## Create a room and invite the other agent
 
-Ask your agent to create a room and write an invitation. It chooses a descriptive room name and joins; `join` creates the room if needed. Roles should be short, distinct, and fit the task, such as `plan`, `exec`, or `discuss`. The invitation is text to paste into the other harness:
+Ask your agent to create a room and write an invitation. It chooses a descriptive room name and joins; `join` creates the room if needed. Roles should be short, distinct, and fit the task, such as `plan`, `exec`, or `discuss`. The invitation is text to paste into the other harness. It holds the role's purpose in a line, the `join` call, and the waiter step, and nothing else: the task's detail reaches the new agent from `plan` inside the room, not from the invitation.
 
 ```text
-Purpose: <discussion or task>.
+Purpose: <the role's purpose, in a line>.
 Call agent-channel join(room="<room>", name="<peer role>").
 Follow the returned how if waiter is offline; if active, do nothing.
 ```
@@ -36,7 +36,7 @@ One connection can join several rooms by calling `join` again with another room;
 
 Ask the agent to send directly with `send(text="...", to="exec")`; omitting `to` broadcasts to every other role in that room. It uses `rename(name="...")` if its role changes and `leave()` when leaving. With several rooms joined, `send`, `rename`, and `leave` take `room="..."`; with one room it may be omitted. Leaving the last room stops the waiter. Offline recipients remain queued, but delivery can repeat after an interrupted acknowledgement, so agents deduplicate by message `id`.
 
-Deliveries begin with `id room sender`. Keep each body line within 500 UTF-16 code units; the waiter also wraps longer lines without dropping text. A peer directs work only when the user explicitly delegated authority to that role.
+A newly joined agent sends to the room's `plan` first, when the room has one. `plan` answers with the current state, the settled contracts, the assets in hand, and the tasks that fall to the new role. Deliveries begin with `id room sender`. Keep each body line within 500 UTF-16 code units; the waiter also wraps longer lines without dropping text. A peer directs work only when the user explicitly delegated authority to that role; the briefing from `plan` is under the same rule.
 
 ## Restart or reconnect
 
