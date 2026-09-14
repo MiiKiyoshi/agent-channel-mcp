@@ -182,6 +182,105 @@ def test_a_close_the_database_refuses_still_stops_the_threads_and_closes(tmp_pat
     assert not [t for t in threading.enumerate() if t.name.startswith("agent-channel")]
 
 
+# A close over a waiter the server runs itself.
+
+def _codex_that_sleeps(bin_dir: Path, marker: str) -> None:
+    codex = bin_dir / "codex"
+    codex.write_text(f"#!/bin/sh\n{marker} &\nwait\n", encoding="utf-8")
+    codex.chmod(0o755)
+
+
+def _marker() -> str:
+    return f"sleep {20 + os.getpid() % 7}.{os.getpid() % 100:02d}"
+
+
+def _still_running(marker: str) -> bool:
+    return subprocess.run(["pgrep", "-f", f"^{marker}$"], capture_output=True, text=True).stdout.strip() != ""
+
+
+def test_a_close_whose_sign_off_is_refused_still_stops_the_managed_waiter(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "codex").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (bin_dir / "codex").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    db = tmp_path / "db"
+    channel = Channel(db)
+    joined = channel.join("room", "exec", "codex")
+    token = channel.token
+    Store(db).request_waiter(token, "thread-1")
+    run = wait_for(lambda: channel.store.last_waiter_for_token(token))
+    assert run["ended_at"] is None
+    worker = wait_for(lambda: channel.worker)
+
+    def refused(token):
+        raise sqlite3.OperationalError("database is locked")
+
+    channel.store.deactivate = refused
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        channel.close()
+    assert not worker.is_alive()                         # told to stop, not left to the sign-off
+    assert channel.worker is None
+    run = Store(db).last_waiter(joined["participant"]["id"], token)
+    assert run["ended_at"] is not None and run["detail"] == "stopped by the server"
+    assert Store(db).token_active(token)                 # the refused sign-off is not hidden
+
+
+def test_a_close_during_a_queue_takes_the_queue_and_its_child_with_it(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    marker = _marker()
+    _codex_that_sleeps(bin_dir, marker)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    db = tmp_path / "db"
+    channel = Channel(db)
+    sender = channel.store.participant("room", "plan")
+    joined = channel.join("room", "exec", "codex")
+    token = channel.token
+    channel.store.send(sender["id"], "hang", to="exec")
+    Store(db).request_waiter(token, "thread-1")
+    wait_for(lambda: _still_running(marker), timeout=8)
+    worker = channel.worker
+    channel.close()
+    assert not worker.is_alive()
+    wait_for(lambda: not _still_running(marker), timeout=3)
+    checker = Store(db)
+    assert checker.pending(joined["participant"]["id"]) is not None       # not acknowledged
+    assert checker.last_waiter(joined["participant"]["id"], token)["detail"] == "stopped by the server"
+    checker.close()
+
+
+def test_a_waiter_signalled_during_a_queue_takes_the_queue_and_its_child_with_it(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    marker = _marker()
+    _codex_that_sleeps(bin_dir, marker)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    db = tmp_path / "db"
+    store = Store(db)
+    sender = store.participant("room", "plan")
+    receiver = store.participant("room", "exec")
+    store.activate(receiver["id"], "tok")
+    store.send(sender["id"], "hang", to="exec")
+    process = subprocess.Popen(
+        [sys.executable, "-m", "agent_channel_mcp.waiter", "--db", str(db), "--token", "tok",
+         "--codex", "thread-1"],
+        env=os.environ.copy(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        wait_for(lambda: _still_running(marker), timeout=8)
+        process.terminate()
+        assert process.wait(timeout=8) == 128 + 15
+        wait_for(lambda: not _still_running(marker), timeout=3)
+        run = store.last_waiter(receiver["id"], "tok")
+        assert run["exit_kind"] == "signal" and run["detail"] == "SIGTERM"
+        assert store.pending(receiver["id"]) is not None
+    finally:
+        if process.poll() is None:
+            process.kill()
+        store.close()
+
+
 # A queue that hangs with a child of its own.
 
 def test_a_timed_out_queue_takes_its_children_with_it(tmp_path, monkeypatch):

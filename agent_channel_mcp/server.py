@@ -30,6 +30,7 @@ class Channel:
         self.supervisor_stop = None
         self.supervisor = None
         self.worker = None
+        self.worker_stop = None
         self.connection_stop = None
         self.connection_thread = None
         # What a background thread died of, kept where join can show it.
@@ -357,21 +358,23 @@ class Channel:
                 return
             if time.monotonic() - failure["at"] < 0.5:
                 return
+        self.worker_stop = threading.Event()
         self.worker = threading.Thread(
             target=self._run_worker,
-            args=(token, request["codex_thread"], request_id, store.latest_run_id(token)),
+            args=(token, request["codex_thread"], request_id, store.latest_run_id(token),
+                  self.worker_stop),
             daemon=True,
             name=f"agent-channel-waiter-{token}",
         )
         self.worker.start()
 
     def _run_worker(self, token: str, codex_thread: str, request_id: str,
-                    runs_before: int) -> None:
+                    runs_before: int, stop: threading.Event) -> None:
         # A failure is kept here and said on stderr: while the database is busy it
         # cannot be written, and the supervisor records it once it can. runs_before
         # is the newest run row when this attempt began; a newer one is this attempt's.
         try:
-            run_waiter(self.store.path, token, codex_thread)
+            run_waiter(self.store.path, token, codex_thread, stop=stop)
             self.worker_failure = None
         except Exception as error:
             detail = f"{type(error).__name__}: {error}"
@@ -380,14 +383,24 @@ class Channel:
             print(f"Waiter did not run: {detail}", file=sys.stderr, flush=True)
 
     def _stop_supervisor(self) -> None:
+        # The worker is told to stop directly: it must not depend on a sign-off the
+        # database may refuse. One still ending keeps its reference and is said on
+        # stderr rather than forgotten alive.
         if self.supervisor_stop is not None:
             self.supervisor_stop.set()
         if self.supervisor is not None:
             self.supervisor.join(timeout=1)
-        if self.worker is not None:
-            self.worker.join(timeout=1)
         self.supervisor_stop = None
         self.supervisor = None
+        if self.worker_stop is not None:
+            self.worker_stop.set()
+        if self.worker is not None:
+            self.worker.join(timeout=3)
+            if self.worker.is_alive():
+                print(f"Managed waiter {self.worker.name} is still ending", file=sys.stderr,
+                      flush=True)
+                return
+        self.worker_stop = None
         self.worker = None
 
     def close(self) -> None:

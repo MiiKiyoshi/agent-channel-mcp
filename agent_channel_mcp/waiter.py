@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -56,8 +57,27 @@ def render_message(message: dict) -> str:
     return "\n".join(output)
 
 
-def run(db: Path, token: str, codex_thread: str | None = None) -> int:
-    """Serve every room the connection identified by `token` has joined."""
+def _await_queue(queue: subprocess.Popen, stop: threading.Event) -> str | None:
+    """How the queue ended: None for delivered, otherwise why not. A stop set while
+    it runs ends the wait; the caller kills what is still running."""
+    deadline = time.monotonic() + CODEX_QUEUE_TIMEOUT_SECONDS
+    while True:
+        try:
+            code = queue.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            if stop.is_set():
+                return "stopped before codex queue returned"
+            if time.monotonic() >= deadline:
+                return f"timed out after {CODEX_QUEUE_TIMEOUT_SECONDS} s"
+            continue
+        return f"exited {code}" if code else None
+
+
+def run(db: Path, token: str, codex_thread: str | None = None,
+        stop: threading.Event | None = None) -> int:
+    """Serve every room the connection identified by `token` has joined, until the
+    token is inactive or `stop` is set (the server closing over a waiter it runs)."""
+    stop = threading.Event() if stop is None else stop
     store = Store(db)
     try:
         with lock(lock_path(store.path, token), owner=token):
@@ -72,7 +92,7 @@ def run(db: Path, token: str, codex_thread: str | None = None) -> int:
                         raise ValueError("Codex thread ID must not be blank")
                     if shutil.which("codex") is None:
                         raise ValueError("codex must be on PATH")
-                while True:
+                while not stop.is_set():
                     try:
                         if not store.token_active(token):
                             break
@@ -83,27 +103,27 @@ def run(db: Path, token: str, codex_thread: str | None = None) -> int:
                             next_heartbeat = time.monotonic() + 5
                         message = store.pending_for_token(token)
                         if message is None:
-                            time.sleep(0.5)
+                            stop.wait(0.5)
                             continue
                         text = render_message(message)
                         if codex_thread is None:
                             print(text, flush=True)
                         else:
-                            # In a session of its own, so a timeout takes its children too.
+                            # In a session of its own, so that ending it, at the timeout,
+                            # at a stop or at a signal, takes its children too.
                             queue = subprocess.Popen(
                                 ["codex", "queue", "--thread", codex_thread, "--message", text],
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 start_new_session=True,
                             )
                             try:
-                                code = queue.wait(timeout=CODEX_QUEUE_TIMEOUT_SECONDS)
-                                failed = f"exited {code}" if code else None
-                            except subprocess.TimeoutExpired:
-                                # Killed at the timeout; not acknowledged, so it is tried again.
-                                os.killpg(queue.pid, signal.SIGKILL)
-                                queue.wait()
-                                failed = f"timed out after {CODEX_QUEUE_TIMEOUT_SECONDS} s"
+                                failed = _await_queue(queue, stop)
+                            finally:
+                                if queue.poll() is None:
+                                    os.killpg(queue.pid, signal.SIGKILL)
+                                    queue.wait()
                             if failed is not None:
+                                # Not acknowledged, so it is tried again.
                                 detail = f"codex queue {failed} for message {message['id']}"
                                 store.waiter_error(token, detail)
                                 if detail != reported_error:
@@ -114,7 +134,7 @@ def run(db: Path, token: str, codex_thread: str | None = None) -> int:
                                         flush=True,
                                     )
                                     reported_error = detail
-                                time.sleep(5)
+                                stop.wait(5)
                                 continue
                         store.ack_for_token(token, message["id"])
                         reported_error = None
@@ -128,7 +148,7 @@ def run(db: Path, token: str, codex_thread: str | None = None) -> int:
                         if detail != reported_error:
                             print(f"Database busy ({error}); retrying", file=sys.stderr, flush=True)
                             reported_error = detail
-                        time.sleep(0.5)
+                        stop.wait(0.5)
             except WaiterSignal as stopped:
                 name = signal.Signals(stopped.signum).name
                 store.waiter_finished(token, "signal", 128 + stopped.signum, name)
@@ -137,7 +157,16 @@ def run(db: Path, token: str, codex_thread: str | None = None) -> int:
                 store.waiter_finished(token, "error", 1, f"{type(error).__name__}: {error}")
                 raise
             else:
-                store.waiter_finished(token, "normal", 0, "token inactive")
+                why = "stopped by the server" if stop.is_set() else "token inactive"
+                try:
+                    store.waiter_finished(token, "normal", 0, why)
+                except sqlite3.OperationalError as error:
+                    # The end is not held up by a database that is busy for it: the
+                    # row it could not close lapses with its heartbeat.
+                    if not is_busy(error):
+                        raise
+                    print(f"Waiter ended ({why}) but could not record it: {error}",
+                          file=sys.stderr, flush=True)
                 return 0
     finally:
         store.close()
