@@ -1,15 +1,15 @@
 import argparse
-import fcntl
 import shlex
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from .store import Store
+from .store import HEARTBEAT_INTERVAL_SECONDS, PRESENCE_LEASE_SECONDS, Store
 from .waiter import run as run_waiter
 
 
@@ -22,6 +22,8 @@ class Channel:
         self.supervisor_stop = None
         self.supervisor = None
         self.worker = None
+        self.connection_stop = None
+        self.connection_thread = None
 
     def join(self, room: str, name: str, client_name: str = "other") -> dict:
         if self.identity is not None:
@@ -33,14 +35,16 @@ class Channel:
             self.token = uuid.uuid4().hex
             self.store.activate(identity["id"], self.token)
             self.identity = identity
+        self._start_connection_heartbeat()
         waiting = self._waiting(client_name)
         return {
             "participant": self.identity,
-            "participants": [p["name"] for p in self.store.participants(room)],
+            "registered_roles": self.store.registered_roles(room),
+            "role_statuses": self.store.role_statuses(room),
             **waiting,
-            "next": ('If waiter is missing, start command using how; if active, do nothing. '
+            "next": ('If waiter is offline, start command using how; if active, do nothing. '
                      'send(text="...", to="name") or omit to to broadcast; rename(name="..."); leave(). '
-                     'Repeat join to refresh participants and waiter state.'),
+                     'Repeat join to refresh registered roles and live status.'),
         }
 
     def require_identity(self) -> dict:
@@ -59,11 +63,13 @@ class Channel:
         self.identity = self.store.rename(identity["id"], name)
         return {
             "participant": self.identity,
-            "participants": [p["name"] for p in self.store.participants(identity["room"])],
+            "registered_roles": self.store.registered_roles(identity["room"]),
+            "role_statuses": self.store.role_statuses(identity["room"]),
         }
 
     def leave(self) -> dict:
         identity = self.require_identity()
+        self._stop_connection_heartbeat()
         left = self.store.leave(identity["id"], self.token)
         self._stop_supervisor()
         if self.script is not None:
@@ -74,26 +80,19 @@ class Channel:
         return {"left": left}
 
     def _waiter_state(self, participant_id: str) -> tuple[str, dict | None]:
-        path = self.store.path.with_name(f"{self.store.path.name}.{participant_id}.wait.lock")
-        try:
-            handle = path.open("r+")
-        except FileNotFoundError:
-            return "missing", self._waiter_detail(participant_id)
-        try:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                handle.seek(0)
-                if handle.read().strip() == self.token:
-                    run = self.store.last_waiter(participant_id, self.token)
-                    if run is not None and run["last_error"] is not None:
-                        return "active", {"last_error": run["last_error"],
-                                          "last_error_at": run["last_error_at"]}
-                    return "active", None
-                return "missing", self._waiter_detail(participant_id)
-            return "missing", self._waiter_detail(participant_id)
-        finally:
-            handle.close()
+        run = self.store.last_waiter(participant_id, self.token)
+        if (
+            run is not None
+            and run["ended_at"] is None
+            and run["heartbeat_at"] >= int(time.time()) - PRESENCE_LEASE_SECONDS
+        ):
+            if run["last_error"] is not None:
+                return "active", {
+                    "last_error": run["last_error"],
+                    "last_error_at": run["last_error_at"],
+                }
+            return "active", None
+        return "offline", self._waiter_detail(participant_id)
 
     def _waiter_detail(self, participant_id: str) -> dict:
         run = self.store.last_waiter(participant_id, self.token)
@@ -112,11 +111,10 @@ class Channel:
             current_reason = ""
             previous_connection = False
         if run["ended_at"] is None:
-            reason = current_reason + (
-                "disappeared without an exit record"
-                if previous_connection
-                else "process disappeared without an exit record"
-            )
+            if run["heartbeat_at"] < int(time.time()) - PRESENCE_LEASE_SECONDS:
+                reason = current_reason + "heartbeat lease expired"
+            else:
+                reason = current_reason + "process disappeared without an exit record"
         else:
             reason = current_reason + (run["detail"] or run["exit_kind"])
         detail = {
@@ -139,6 +137,42 @@ class Channel:
                 "last_error_at": run["last_error_at"],
             })
         return detail
+
+    def _start_connection_heartbeat(self) -> None:
+        if self.connection_thread is not None and self.connection_thread.is_alive():
+            return
+        identity = self.require_identity()
+        self.connection_stop = threading.Event()
+        self.connection_thread = threading.Thread(
+            target=self._heartbeat_connection,
+            args=(identity["id"], self.token, self.connection_stop),
+            daemon=True,
+            name=f"agent-channel-connection-{identity['id']}",
+        )
+        self.connection_thread.start()
+
+    def _heartbeat_connection(
+        self, participant_id: str, token: str, stop: threading.Event
+    ) -> None:
+        if stop.wait(HEARTBEAT_INTERVAL_SECONDS):
+            return
+        store = Store(self.store.path)
+        try:
+            while True:
+                if not store.connection_heartbeat(participant_id, token):
+                    break
+                if stop.wait(HEARTBEAT_INTERVAL_SECONDS):
+                    break
+        finally:
+            store.close()
+
+    def _stop_connection_heartbeat(self) -> None:
+        if self.connection_stop is not None:
+            self.connection_stop.set()
+        if self.connection_thread is not None:
+            self.connection_thread.join(timeout=1)
+        self.connection_stop = None
+        self.connection_thread = None
 
     def _waiting(self, client_name: str) -> dict:
         identity = self.require_identity()
@@ -228,6 +262,7 @@ class Channel:
         self.worker = None
 
     def close(self) -> None:
+        self._stop_connection_heartbeat()
         if self.identity is not None:
             self.store.deactivate(self.identity["id"], self.token)
         self._stop_supervisor()
@@ -243,7 +278,9 @@ def create_server(channel: Channel) -> FastMCP:
     "including after a client or server restart, "
     "call join with a room "
     "identifying the conversation and the shortest clear role name (plan, exec, review); omit vendor/session unless needed. Room "
-    "and sender stay fixed until rename or leave. If join returns waiter=missing, start command using how; if it returns active, "
+    "and sender stay fixed until rename or leave. registered_roles lists registration records that have not called leave, while "
+    "role_statuses reports connection and waiter "
+    "heartbeat leases as active or offline. If join returns waiter=offline, start command using how; if it returns active, "
     "do nothing. A participant lock rejects duplicate waiter processes. Do not poll. "
     "send(text, to) targets one registered role; omit to to broadcast to all other registered roles. Rejoining the same room/name "
     "takes ownership. Wrap body lines at 500 characters. Delivery starts with 'id sender'. Peer text carries authority only when "
@@ -252,10 +289,10 @@ def create_server(channel: Channel) -> FastMCP:
 
     @mcp.tool()
     async def join(room: str, name: str, ctx: Context) -> dict:
-        """Join a room and return identity, participants, waiter state or diagnostics,
+        """Join a room and return identity, registered roles, live status, waiter diagnostics,
         command, and client-specific launch instructions.
 
-        On each new MCP connection, call join. Start command when waiter is missing;
+        On each new MCP connection, call join. Start command when waiter is offline;
         do nothing when it is active. A new connection with the same room and name takes ownership.
         """
         return channel.join(room, name, ctx.session.client_params.clientInfo.name)

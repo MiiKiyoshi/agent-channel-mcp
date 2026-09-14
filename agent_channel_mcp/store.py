@@ -5,6 +5,8 @@ from pathlib import Path
 
 
 ROOM_TTL_SECONDS = 12 * 60 * 60
+HEARTBEAT_INTERVAL_SECONDS = 5
+PRESENCE_LEASE_SECONDS = 15
 
 
 class Store:
@@ -59,6 +61,10 @@ class Store:
             }
             if "left_at" not in columns:
                 self.db.execute("ALTER TABLE participants ADD COLUMN left_at INTEGER")
+            if "connection_heartbeat_at" not in columns:
+                self.db.execute(
+                    "ALTER TABLE participants ADD COLUMN connection_heartbeat_at INTEGER"
+                )
             self.db.execute(
                 "INSERT OR IGNORE INTO rooms(name, last_activity) "
                 "SELECT DISTINCT room, ? FROM participants", (int(time.time()),)
@@ -80,12 +86,14 @@ class Store:
         cutoff = now - ROOM_TTL_SECONDS
         rooms = [row["name"] for row in self.db.execute(
             "SELECT r.name FROM rooms r WHERE r.last_activity<=? "
-            "AND NOT EXISTS (SELECT 1 FROM participants p WHERE p.room=r.name AND p.token IS NOT NULL) "
+            "AND NOT EXISTS (SELECT 1 FROM participants p WHERE p.room=r.name "
+            "  AND p.left_at IS NULL AND p.token IS NOT NULL "
+            "  AND p.connection_heartbeat_at>=?) "
             "AND NOT EXISTS ("
             "  SELECT 1 FROM messages m JOIN participants p ON p.id=m.recipient_id "
             "  WHERE p.room=r.name AND m.acknowledged=0"
             ") ORDER BY r.name",
-            (cutoff,),
+            (cutoff, now - PRESENCE_LEASE_SECONDS),
         )]
         for room in rooms:
             self.db.execute(
@@ -122,6 +130,41 @@ class Store:
             "WHERE room=? AND left_at IS NULL ORDER BY name", (room,)
         )]
 
+    def registered_roles(self, room: str) -> list[str]:
+        return [row["name"] for row in self.db.execute(
+            "SELECT name FROM participants "
+            "WHERE room=? AND left_at IS NULL ORDER BY name", (room,)
+        )]
+
+    def role_statuses(self, room: str, now: int | None = None) -> list[dict]:
+        current = int(time.time()) if now is None else now
+        cutoff = current - PRESENCE_LEASE_SECONDS
+        statuses = []
+        for participant in self.db.execute(
+            "SELECT id, name, token, connection_heartbeat_at "
+            "FROM participants WHERE room=? AND left_at IS NULL ORDER BY name", (room,)
+        ).fetchall():
+            present = participant["token"] is not None
+            connection_active = (
+                present
+                and participant["connection_heartbeat_at"] is not None
+                and participant["connection_heartbeat_at"] >= cutoff
+            )
+            waiter_active = False
+            if present:
+                waiter = self.last_waiter(participant["id"], participant["token"])
+                waiter_active = (
+                    waiter is not None
+                    and waiter["ended_at"] is None
+                    and waiter["heartbeat_at"] >= cutoff
+                )
+            statuses.append({
+                "name": participant["name"],
+                "connection": "active" if connection_active else "offline",
+                "waiter": "active" if waiter_active else "offline",
+            })
+        return statuses
+
     def send(self, sender_id: str, text: str, to: str | None = None) -> list[dict]:
         if not text.strip():
             raise ValueError("text must not be blank")
@@ -143,7 +186,10 @@ class Store:
                     "AND left_at IS NULL", (sender["room"], to)
                 ).fetchall()
                 if not recipients:
-                    raise ValueError("Recipient has not joined this room; call join() again to refresh participants")
+                    raise ValueError(
+                        "Recipient is not registered in this room; call join() again "
+                        "to refresh registered roles and live status"
+                    )
             deliveries = []
             for recipient in recipients:
                 cursor = self.db.execute(
@@ -187,7 +233,8 @@ class Store:
                 (participant_id, token),
             )
             self.db.execute(
-                "UPDATE participants SET token=NULL, left_at=? WHERE id=? AND token=?",
+                "UPDATE participants SET token=NULL, connection_heartbeat_at=NULL, left_at=? "
+                "WHERE id=? AND token=?",
                 (now, participant_id, token),
             )
             self._touch(participant["room"], now)
@@ -211,14 +258,25 @@ class Store:
             )
 
     def activate(self, participant_id: str, token: str) -> None:
+        now = int(time.time())
         with self.db:
             self.db.execute(
                 "DELETE FROM waiter_requests WHERE participant_id=?", (participant_id,)
             )
             self.db.execute(
-                "UPDATE participants SET token=? WHERE id=? AND left_at IS NULL",
-                (token, participant_id),
+                "UPDATE participants SET token=?, connection_heartbeat_at=? "
+                "WHERE id=? AND left_at IS NULL",
+                (token, now, participant_id),
             )
+
+    def connection_heartbeat(self, participant_id: str, token: str) -> bool:
+        with self.db:
+            cursor = self.db.execute(
+                "UPDATE participants SET connection_heartbeat_at=? "
+                "WHERE id=? AND token=? AND left_at IS NULL",
+                (int(time.time()), participant_id, token),
+            )
+        return cursor.rowcount == 1
 
     def deactivate(self, participant_id: str, token: str) -> None:
         with self.db:
@@ -227,7 +285,8 @@ class Store:
                 (participant_id, token),
             )
             self.db.execute(
-                "UPDATE participants SET token=NULL WHERE id=? AND token=?", (participant_id, token)
+                "UPDATE participants SET token=NULL, connection_heartbeat_at=NULL "
+                "WHERE id=? AND token=?", (participant_id, token)
             )
 
     def is_active(self, participant_id: str, token: str) -> bool:

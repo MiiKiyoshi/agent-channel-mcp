@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from agent_channel_mcp.store import Store
+from agent_channel_mcp.store import PRESENCE_LEASE_SECONDS, Store
 from agent_channel_mcp.server import Channel
 from agent_channel_mcp.waiter import render_message
 
@@ -169,7 +169,7 @@ def test_existing_database_is_migrated_without_losing_participants(tmp_path):
 
     store = Store(path)
     columns = {row["name"] for row in store.db.execute("PRAGMA table_info(participants)")}
-    assert "left_at" in columns
+    assert {"left_at", "connection_heartbeat_at"} <= columns
     assert store.participants("room") == [
         {"id": "participant-id", "room": "room", "name": "plan"}
     ]
@@ -181,6 +181,37 @@ def test_existing_database_is_migrated_without_losing_participants(tmp_path):
     assert store.db.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='waiter_requests'"
     ).fetchone() is not None
+    store.close()
+
+
+def test_stale_registered_roles_are_reported_offline(tmp_path):
+    store = make_store(tmp_path)
+    active = store.participant("room", "active")
+    research = store.participant("room", "research")
+    write = store.participant("room", "write")
+    store.activate(active["id"], "active-token")
+    store.activate(research["id"], "research-token")
+    store.activate(write["id"], "write-token")
+    active_run = store.waiter_started(active["id"], "active-token", 1001)
+    write_run = store.waiter_started(write["id"], "write-token", 1002)
+    now = int(time.time())
+    stale = now - PRESENCE_LEASE_SECONDS - 1
+    with store.db:
+        store.db.execute(
+            "UPDATE participants SET connection_heartbeat_at=? WHERE id IN (?, ?)",
+            (stale, research["id"], write["id"]),
+        )
+        store.db.execute(
+            "UPDATE waiter_runs SET heartbeat_at=? WHERE id=?", (stale, write_run)
+        )
+
+    assert store.registered_roles("room") == ["active", "research", "write"]
+    assert store.role_statuses("room", now=now) == [
+        {"name": "active", "connection": "active", "waiter": "active"},
+        {"name": "research", "connection": "offline", "waiter": "offline"},
+        {"name": "write", "connection": "offline", "waiter": "offline"},
+    ]
+    store.waiter_finished(active_run, "normal", 0, "test complete")
     store.close()
 
 
@@ -443,7 +474,7 @@ def test_waiter_records_signal_exit_and_join_reports_abrupt_loss(tmp_path):
         assert run["exit_code"] == 128 + 15
         assert run["detail"] == "SIGTERM"
         signaled = channel.join("room", "plan")
-        assert signaled["waiter"] == "missing"
+        assert signaled["waiter"] == "offline"
         assert signaled["waiter_detail"]["reason"] == "SIGTERM"
         assert signaled["waiter_detail"]["exit_kind"] == "signal"
 
@@ -459,12 +490,17 @@ def test_waiter_records_signal_exit_and_join_reports_abrupt_loss(tmp_path):
         )
         replacement.kill()
         replacement.wait(timeout=2)
-        wait_for(lambda: channel.join("room", "plan")["waiter"] == "missing")
+        replacement_run = channel.store.last_waiter(participant["id"], channel.token)
+        stale_heartbeat = int(time.time()) - PRESENCE_LEASE_SECONDS - 1
+        with channel.store.db:
+            channel.store.db.execute(
+                "UPDATE waiter_runs SET heartbeat_at=? WHERE id=?",
+                (stale_heartbeat, replacement_run["id"]),
+            )
         status = channel.join("room", "plan")
-        assert status["waiter_detail"]["reason"] == (
-            "process disappeared without an exit record"
-        )
-        assert status["waiter_detail"]["last_seen_at"] >= run["ended_at"]
+        assert status["waiter"] == "offline"
+        assert status["waiter_detail"]["reason"] == "heartbeat lease expired"
+        assert status["waiter_detail"]["last_seen_at"] == stale_heartbeat
     finally:
         if process.poll() is None:
             process.kill()
