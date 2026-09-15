@@ -283,7 +283,9 @@ class Channel:
         command = "sh " + shlex.quote(str(self.script))
         name = client_name.casefold()
         if "claude" in name:
-            how = "Monitor(command=<command>, persistent=true, timeout_ms=3600000); then end the turn."
+            how = ("Monitor(command=<command>, timeout_ms=1800000); then end the turn. A Monitor "
+                   "expires after 30 minutes and ends the waiter: on each expiry notice, call join "
+                   "again and follow its result.")
         elif "codex" in name:
             self._start_supervisor(self.token)
             command += ' --register --codex "${CODEX_THREAD_ID:?CODEX_THREAD_ID is required}"'
