@@ -171,6 +171,42 @@ def test_a_waiter_lock_path_that_is_a_link_is_refused_and_its_target_untouched(t
     assert lock_owned(lock_path(db, "linked-token"), "linked-token") is False
 
 
+def test_a_fifo_at_a_presence_or_lock_path_is_refused_within_a_bound(tmp_path):
+    """A FIFO with no peer would hold a blocking open forever; every opener answers
+    in bounded time instead, and regular files keep working."""
+    import threading
+    from agent_channel_mcp.waiter import lock, lock_owned, lock_path
+    db = tmp_path / "db"
+    store = Store(db)
+    for path in (store._presence_path("connection", "fifo"), lock_path(db, "fifo")):
+        os.mkfifo(path)
+
+    def bounded(call):
+        box = {}
+        def run():
+            try:
+                box["value"] = call()
+            except OSError as error:
+                box["error"] = error
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(timeout=3)
+        assert not thread.is_alive(), "the open blocked"
+        return box
+
+    assert bounded(lambda: store._presence_mtime("connection", "fifo")) == {"value": None}
+    assert "error" in bounded(lambda: store._presence_touch("connection", "fifo"))
+    assert "error" in bounded(lambda: lock(lock_path(db, "fifo"), "fifo"))
+    assert bounded(lambda: lock_owned(lock_path(db, "fifo"), "fifo")) == {"value": False}
+    # Regular files as before: touched, read, locked, owned.
+    store._presence_touch("connection", "plain")
+    assert store._presence_mtime("connection", "plain") is not None
+    handle = lock(lock_path(db, "plain"), "plain")
+    assert lock_owned(lock_path(db, "plain"), "plain") is True
+    handle.close()
+    store.close()
+
+
 # Telling liveness from the files.
 
 def test_presence_is_the_later_of_the_file_and_the_column_for_that_token_only(tmp_path):

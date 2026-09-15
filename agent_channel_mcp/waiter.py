@@ -27,10 +27,13 @@ class WaiterSignal(Exception):
 def _open_lock_file(path: Path, flags: int):
     """The lock file itself, never a link followed to another file and never a
     special file, checked on the descriptor that is then used."""
-    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    # Non-blocking, so a FIFO left at the path cannot hold the open until a peer
+    # appears; once the file is known to be regular the flag is dropped again.
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(f"{path} is not a regular file")
+        fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
     except BaseException:
         os.close(fd)
         raise

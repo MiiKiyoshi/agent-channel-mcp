@@ -171,7 +171,9 @@ class Store:
         """The file itself, never a link to one and never a special file: opened
         without following symlinks and checked after opening, so the file that is
         touched or read is the one that was checked."""
-        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        # Non-blocking, so a FIFO left at the path cannot hold the open until a peer
+        # appears; the flag changes nothing for the regular file this must be.
+        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise OSError(f"{path} is not a regular file")
