@@ -1,5 +1,6 @@
-"""One delivery per message id at a Codex thread: the key, the look before the add,
-the conflict, the unsupported API, and the lock between two waiters."""
+"""At most one delivery per message id at a Codex thread: the key, the look instead
+of a second add, the uncertain state, the conflict, the unsupported API, and the lock
+between two waiters."""
 
 import threading
 import time
@@ -8,9 +9,9 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from agent_channel_mcp import waiter as waiter_module
-from agent_channel_mcp.codex_sink import CodexSink, KeyConflict, SinkUnsupported
+from agent_channel_mcp.codex_sink import CodexSink, KeyConflict, SinkError, SinkUnsupported
 from agent_channel_mcp.store import Store
-from agent_channel_mcp.waiter import deliver_to_codex, render_message
+from agent_channel_mcp.waiter import DeliveryUncertain, deliver_to_codex, render_message
 from fake_app_server import FakeCodex
 
 
@@ -82,6 +83,104 @@ def test_a_repeated_attempt_finds_the_message_and_does_not_add_it_again(tmp_path
     store.close()
 
 
+# The gap: handed over once, in neither the queue nor the items.
+
+def test_a_marked_message_found_nowhere_is_not_added_again_and_is_acknowledged_once_it_appears(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(waiter_module, "CODEX_QUEUE_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(waiter_module, "CODEX_RETRY_PAUSE_SECONDS", 0.2)
+    monkeypatch.setattr(waiter_module, "CODEX_UNCERTAIN_PAUSE_SECONDS", 0.3)
+    codex = FakeCodex(tmp_path / "bin", consume="in_transit", drop_add_response=True).apply(monkeypatch)
+    store, receiver, message_id = _store_with_message(tmp_path / "db")
+    stop = threading.Event()
+    thread = _run_waiter(tmp_path / "db", stop)
+    try:
+        # The add is taken but never answered; the retry finds the message nowhere.
+        run = wait_for(lambda: (
+            (run := store.last_waiter(receiver["id"], "tok")) and run["last_error"]
+            and "uncertain" in run["last_error"] and run
+        ))
+        assert run["last_error"] == f"delivery uncertain for message {message_id}; not re-adding"
+        time.sleep(1.0)                                                      # several looks
+        assert codex.requests().count("thread/queue/add") == 1
+        assert codex.requests().count("thread/items/list") >= 2
+        assert store.pending(receiver["id"])["id"] == message_id
+        assert codex.transit("thread-1") and codex.items("thread-1") == []
+        # A later message is served meanwhile, in the same state of doubt only if it
+        # meets the same failure; here the add answers again.
+        codex.set(drop_add_response=None, consume="immediate")
+        later = store.send(store.participant("room", "plan")["id"], "later", to="exec")[0]["message_id"]
+        wait_for(lambda: f"{later} room plan\nlater" in codex.texts("thread-1"))
+        assert store.pending(receiver["id"])["id"] == message_id            # still first, still unacknowledged
+        # The item becomes visible: the next look acknowledges, with no add.
+        codex.arrive("thread-1")
+        wait_for(lambda: store.pending(receiver["id"]) is None)
+        assert codex.requests().count("thread/queue/add") == 2               # one per message
+        assert sorted(codex.texts("thread-1")) == sorted([f"{later} room plan\nlater", f"{message_id} room plan\nhello"])
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+        store.close()
+
+
+def test_a_marked_message_that_never_appears_stays_pending_and_uncertain(tmp_path, monkeypatch):
+    monkeypatch.setattr(waiter_module, "CODEX_QUEUE_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(waiter_module, "CODEX_RETRY_PAUSE_SECONDS", 0.2)
+    monkeypatch.setattr(waiter_module, "CODEX_UNCERTAIN_PAUSE_SECONDS", 0.2)
+    codex = FakeCodex(tmp_path / "bin", consume="in_transit", drop_add_response=True).apply(monkeypatch)
+    store, receiver, message_id = _store_with_message(tmp_path / "db")
+    stop = threading.Event()
+    thread = _run_waiter(tmp_path / "db", stop)
+    try:
+        wait_for(lambda: (
+            (run := store.last_waiter(receiver["id"], "tok")) and run["last_error"]
+            and "uncertain" in run["last_error"]
+        ))
+        time.sleep(2.0)
+        assert codex.requests().count("thread/queue/add") == 1
+        assert store.pending(receiver["id"])["id"] == message_id
+        assert store.last_waiter(receiver["id"], "tok")["last_error"] == (
+            f"delivery uncertain for message {message_id}; not re-adding"
+        )
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+        store.close()
+
+
+def test_the_delivery_raises_uncertain_for_a_marked_message_found_nowhere(tmp_path, monkeypatch):
+    FakeCodex(tmp_path / "bin").apply(monkeypatch)
+    store, receiver, message_id = _store_with_message(tmp_path / "db")
+    store.mark_attempted(message_id)
+    message = store.pending_for_token("tok")
+    sink = CodexSink(timeout=5)
+    try:
+        with pytest.raises(DeliveryUncertain, match=f"message {message_id}; not re-adding"):
+            deliver_to_codex(store, sink, "thread-1", message, render_message(message))
+    finally:
+        sink.close()
+    store.close()
+
+
+def test_an_answered_refusal_clears_the_mark_so_the_next_attempt_may_add(tmp_path, monkeypatch):
+    codex = FakeCodex(tmp_path / "bin", add_error="thread is busy").apply(monkeypatch)
+    store, receiver, message_id = _store_with_message(tmp_path / "db")
+    message = store.pending_for_token("tok")
+    sink = CodexSink(timeout=5)
+    try:
+        with pytest.raises(SinkError, match="thread is busy"):
+            deliver_to_codex(store, sink, "thread-1", message, render_message(message))
+        assert store.pending_for_token("tok")["attempted"] == 0
+        codex.set(add_error=None)
+        assert deliver_to_codex(store, sink, "thread-1", store.pending_for_token("tok"),
+                                render_message(message)) == "added"
+    finally:
+        sink.close()
+    assert codex.requests().count("thread/queue/add") == 2
+    store.close()
+
+
 # The conflict: the key is taken by other text.
 
 def test_a_key_held_by_other_text_is_a_conflict_that_is_reported_once_and_never_added(tmp_path, monkeypatch):
@@ -149,13 +248,14 @@ def test_the_sink_raises_unsupported_on_the_capability_error(tmp_path, monkeypat
         sink.close()
 
 
-# Two waiters at once: the lock makes one look after the other's add.
+# Two waiters at once, each having read the message unmarked: the lock makes the
+# second read the mark the first wrote, and look instead of add.
 
-def test_two_waiters_delivering_the_same_marked_message_add_it_once(tmp_path, monkeypatch):
+def test_two_waiters_delivering_the_same_message_add_it_once(tmp_path, monkeypatch):
     codex = FakeCodex(tmp_path / "bin", hold_add_seconds=1).apply(monkeypatch)
     store, receiver, message_id = _store_with_message(tmp_path / "db")
-    store.mark_attempted(message_id)
     message = store.pending_for_token("tok")
+    assert message["attempted"] == 0
     text = render_message(message)
 
     def deliver(_):

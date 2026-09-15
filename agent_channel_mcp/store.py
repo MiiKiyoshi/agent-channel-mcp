@@ -495,10 +495,22 @@ class Store:
 
     def mark_attempted(self, message_id: int) -> None:
         """Written before a delivery is handed to a receiver, so that a crash or a lost
-        answer after the hand-over leaves the message marked and the next attempt
-        looks for it at the receiver before adding it again."""
+        answer after the hand-over leaves the message marked: a marked message is only
+        ever looked for at the receiver, never added again."""
         with self.db:
             self.db.execute("UPDATE messages SET attempted=1 WHERE id=?", (message_id,))
+
+    def attempted(self, message_id: int) -> bool:
+        """Whether a delivery of the message may already have reached its receiver;
+        read under the delivery lock, since another waiter may have marked it."""
+        row = self.db.execute("SELECT attempted FROM messages WHERE id=?", (message_id,)).fetchone()
+        return bool(row and row["attempted"])
+
+    def clear_attempted(self, message_id: int) -> None:
+        """When the receiver answered that it did not take the message: the hand-over
+        is known not to have happened, so the next attempt may add."""
+        with self.db:
+            self.db.execute("UPDATE messages SET attempted=0 WHERE id=?", (message_id,))
 
     def ack(self, participant_id: str, message_id: int) -> None:
         with self.db:
