@@ -111,6 +111,7 @@ def test_join_returns_waiter_command_and_old_token_is_invalidated(tmp_path):
             "reason": "not started for this connection"
         }
         assert "Monitor(" in result["how"]
+        assert "on each expiry notice, call join again" in result["how"]
         assert Path(shlex.split(result["command"])[1]).exists()
         assert first.join("room", "claude", "claude-code") == result
         first.store.waiter_started(identity["id"], first.token, 12345)
