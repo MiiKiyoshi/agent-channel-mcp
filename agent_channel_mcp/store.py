@@ -1,6 +1,7 @@
 import os
 import re
 import sqlite3
+import stat
 import time
 import uuid
 from pathlib import Path
@@ -61,7 +62,12 @@ class Store:
             if version == SCHEMA_VERSION:
                 return
             self.db.execute("BEGIN IMMEDIATE")
-            if self.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
+            version = self.db.execute("PRAGMA user_version").fetchone()[0]
+            if version > SCHEMA_VERSION:              # raised meanwhile by newer code
+                raise RuntimeError(
+                    f"{self.path} has schema version {version}; this code knows {SCHEMA_VERSION}"
+                )
+            if version == SCHEMA_VERSION:
                 self.db.rollback()
                 return
             self.db.execute(
@@ -160,18 +166,38 @@ class Store:
         suffix = "conn" if kind == "connection" else "wait.lock"
         return self.path.with_name(f"{self.path.name}.{token}.{suffix}")
 
-    def _presence_touch(self, kind: str, token: str) -> None:
-        path = self._presence_path(kind, token)
+    @staticmethod
+    def _presence_fd(path: Path, flags: int) -> int:
+        """The file itself, never a link to one and never a special file: opened
+        without following symlinks and checked after opening, so the file that is
+        touched or read is the one that was checked."""
+        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
-            os.utime(path, None)
-        except FileNotFoundError:
-            path.touch(mode=0o600)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(f"{path} is not a regular file")
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    def _presence_touch(self, kind: str, token: str) -> None:
+        fd = self._presence_fd(self._presence_path(kind, token), os.O_WRONLY | os.O_CREAT)
+        try:
+            os.utime(fd, None)
+        finally:
+            os.close(fd)
 
     def _presence_mtime(self, kind: str, token: str) -> int | None:
+        """None when there is no such file, or when what is there is not a plain
+        file of ours: an unreadable presence says nothing."""
         try:
-            return int(self._presence_path(kind, token).stat().st_mtime)
-        except (FileNotFoundError, ValueError):
+            fd = self._presence_fd(self._presence_path(kind, token), os.O_RDONLY)
+        except (OSError, ValueError):
             return None
+        try:
+            return int(os.fstat(fd).st_mtime)
+        finally:
+            os.close(fd)
 
     @staticmethod
     def _later(column: int | None, mtime: int | None) -> tuple[int | None, str | None]:
