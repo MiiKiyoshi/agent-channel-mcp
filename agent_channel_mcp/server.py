@@ -186,6 +186,7 @@ class Channel:
             "pid": run["pid"],
             "started_at": run["started_at"],
             "last_seen_at": run["heartbeat_at"],
+            "last_seen_source": run["heartbeat_source"],   # "file": its lock file's mtime; "db": its run row
         }
         if previous_connection:
             detail["previous_connection"] = True
@@ -234,7 +235,7 @@ class Channel:
                         break
                     pause = 0.5
                     wait = HEARTBEAT_INTERVAL_SECONDS
-                except sqlite3.Error as error:
+                except (sqlite3.Error, OSError) as error:    # the beat touches a file too
                     if not is_busy(error):
                         self.connection_failure = f"{type(error).__name__}: {error}"
                         print(f"Connection heartbeat stopped: {error}", file=sys.stderr, flush=True)

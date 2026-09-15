@@ -147,7 +147,7 @@ def test_a_store_whose_setup_fails_closes_its_connection(tmp_path, monkeypatch):
 
     class RefusesToBegin(sqlite3.Connection):
         def execute(self, sql, *args):
-            if sql == "BEGIN IMMEDIATE":
+            if sql == "PRAGMA synchronous = NORMAL":          # setup fails after the connect
                 raise sqlite3.OperationalError("database is locked")
             return super().execute(sql, *args)
 

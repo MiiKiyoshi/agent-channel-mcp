@@ -1,3 +1,5 @@
+import os
+import re
 import sqlite3
 import time
 import uuid
@@ -7,6 +9,11 @@ from pathlib import Path
 ROOM_TTL_SECONDS = 12 * 60 * 60
 HEARTBEAT_INTERVAL_SECONDS = 5
 PRESENCE_LEASE_SECONDS = 15
+# Bumped when the tables or columns change; a store at this version skips the setup
+# transaction, so opening a connection takes no write lock.
+SCHEMA_VERSION = 1
+# A token names presence files beside the database; it is a file-name component.
+TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 def is_busy(error: sqlite3.Error) -> bool:
@@ -41,7 +48,22 @@ class Store:
             # instead, outside the write lock; a process crash loses nothing, only a
             # power loss can drop the last commits, and a message channel can bear that.
             self.db.execute("PRAGMA synchronous = NORMAL")
+            # A store already at this code's schema version is opened with reads only:
+            # the setup below is skipped, and with it the write lock every connection
+            # used to take. A newer version is refused; an older one is brought up to
+            # date under the write lock, re-reading the version there in case another
+            # process did it first.
+            version = self.db.execute("PRAGMA user_version").fetchone()[0]
+            if version > SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"{self.path} has schema version {version}; this code knows {SCHEMA_VERSION}"
+                )
+            if version == SCHEMA_VERSION:
+                return
             self.db.execute("BEGIN IMMEDIATE")
+            if self.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
+                self.db.rollback()
+                return
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS rooms "
                 "(name TEXT PRIMARY KEY, last_activity INTEGER NOT NULL)"
@@ -115,11 +137,59 @@ class Store:
                 "INSERT OR IGNORE INTO rooms(name, last_activity) "
                 "SELECT DISTINCT room, ? FROM participants", (int(time.time()),)
             )
+            self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self.db.commit()
         except Exception:
             self.db.rollback()
             self.db.close()
             raise
+
+    # Presence lives in files beside the database, one per connection token and one per
+    # waiter token (the waiter's lock file), refreshed by touching their mtime: the
+    # heartbeat that every connection and waiter repeats never takes the database's
+    # write lock. Presence columns stay in the tables and are still written by the
+    # events that already write (join, waiter start, errors, exits), and by servers
+    # of the previous version; a reader takes the later of file and column for the
+    # same token, so an old process is seen while it runs, and a token's file can
+    # never vouch for another token. Touching a file is a write to the same disk and
+    # can itself wait on it; nothing here claims presence is immune to that.
+
+    def _presence_path(self, kind: str, token: str) -> Path:
+        if not TOKEN_PATTERN.fullmatch(token):
+            raise ValueError("token must be 1-64 characters of [A-Za-z0-9_-]")
+        suffix = "conn" if kind == "connection" else "wait.lock"
+        return self.path.with_name(f"{self.path.name}.{token}.{suffix}")
+
+    def _presence_touch(self, kind: str, token: str) -> None:
+        path = self._presence_path(kind, token)
+        try:
+            os.utime(path, None)
+        except FileNotFoundError:
+            path.touch(mode=0o600)
+
+    def _presence_mtime(self, kind: str, token: str) -> int | None:
+        try:
+            return int(self._presence_path(kind, token).stat().st_mtime)
+        except (FileNotFoundError, ValueError):
+            return None
+
+    @staticmethod
+    def _later(column: int | None, mtime: int | None) -> tuple[int | None, str | None]:
+        """The later of the two presence readings and where it came from."""
+        if mtime is not None and (column is None or mtime >= column):
+            return mtime, "file"
+        if column is not None:
+            return column, "db"
+        return None, None
+
+    def connection_seen_at(self, token: str) -> int | None:
+        """When this connection was last seen: its presence file, or the column a
+        previous-version server writes, whichever is later."""
+        row = self.db.execute(
+            "SELECT max(connection_heartbeat_at) AS at FROM participants "
+            "WHERE token=? AND left_at IS NULL", (token,)
+        ).fetchone()
+        return self._later(row["at"], self._presence_mtime("connection", token))[0]
 
     def _touch(self, room: str, now: int) -> None:
         self.db.execute(
@@ -141,17 +211,22 @@ class Store:
 
     def _collect_garbage(self, now: int) -> list[str]:
         cutoff = now - ROOM_TTL_SECONDS
-        rooms = [row["name"] for row in self.db.execute(
+        lease = now - PRESENCE_LEASE_SECONDS
+        rooms = []
+        for row in self.db.execute(
             "SELECT r.name FROM rooms r WHERE r.last_activity<=? "
-            "AND NOT EXISTS (SELECT 1 FROM participants p WHERE p.room=r.name "
-            "  AND p.left_at IS NULL AND p.token IS NOT NULL "
-            "  AND p.connection_heartbeat_at>=?) "
             "AND NOT EXISTS ("
             "  SELECT 1 FROM messages m JOIN participants p ON p.id=m.recipient_id "
             "  WHERE p.room=r.name AND m.acknowledged=0"
             ") ORDER BY r.name",
-            (cutoff, now - PRESENCE_LEASE_SECONDS),
-        )]
+            (cutoff,),
+        ).fetchall():
+            tokens = [t["token"] for t in self.db.execute(
+                "SELECT DISTINCT token FROM participants WHERE room=? AND left_at IS NULL "
+                "AND token IS NOT NULL", (row["name"],)
+            )]
+            if not any((self.connection_seen_at(token) or 0) >= lease for token in tokens):
+                rooms.append(row["name"])
         for room in rooms:
             self.db.execute(
                 "DELETE FROM messages WHERE sender_id IN "
@@ -206,14 +281,13 @@ class Store:
         cutoff = current - PRESENCE_LEASE_SECONDS
         statuses = []
         for participant in self.db.execute(
-            "SELECT id, name, token, connection_heartbeat_at "
-            "FROM participants WHERE room=? AND left_at IS NULL ORDER BY name", (room,)
+            "SELECT id, name, token FROM participants "
+            "WHERE room=? AND left_at IS NULL ORDER BY name", (room,)
         ).fetchall():
             present = participant["token"] is not None
             connection_active = (
                 present
-                and participant["connection_heartbeat_at"] is not None
-                and participant["connection_heartbeat_at"] >= cutoff
+                and (self.connection_seen_at(participant["token"]) or 0) >= cutoff
             )
             waiter_active = False
             if present:
@@ -383,21 +457,21 @@ class Store:
 
     def activate(self, participant_id: str, token: str) -> None:
         now = int(time.time())
+        self._presence_path("connection", token)          # a token that can name a file
         with self.db:
             self.db.execute(
                 "UPDATE participants SET token=?, connection_heartbeat_at=? "
                 "WHERE id=? AND left_at IS NULL",
                 (token, now, participant_id),
             )
+        self._presence_touch("connection", token)
 
     def connection_heartbeat(self, token: str) -> bool:
-        with self.db:
-            cursor = self.db.execute(
-                "UPDATE participants SET connection_heartbeat_at=? "
-                "WHERE token=? AND left_at IS NULL",
-                (int(time.time()), token),
-            )
-        return cursor.rowcount > 0
+        """Refresh the connection's presence file; False once the token owns nothing."""
+        if not self.token_active(token):
+            return False
+        self._presence_touch("connection", token)
+        return True
 
     def deactivate(self, token: str) -> None:
         with self.db:
@@ -406,6 +480,10 @@ class Store:
                 "UPDATE participants SET token=NULL, connection_heartbeat_at=NULL "
                 "WHERE token=?", (token,)
             )
+        try:
+            self._presence_path("connection", token).unlink(missing_ok=True)
+        except ValueError:
+            pass
 
     def is_active(self, participant_id: str, token: str) -> bool:
         return self.db.execute(
@@ -455,11 +533,8 @@ class Store:
         return cursor.lastrowid
 
     def waiter_heartbeat(self, token: str) -> None:
-        with self.db:
-            self.db.execute(
-                "UPDATE waiter_runs SET heartbeat_at=? WHERE token=? AND ended_at IS NULL",
-                (int(time.time()), token),
-            )
+        """Refresh the waiter's presence: the mtime of its lock file, no database write."""
+        self._presence_touch("waiter", token)
 
     def waiter_error(self, token: str, detail: str) -> None:
         now = int(time.time())
@@ -486,9 +561,23 @@ class Store:
             )
 
     _WAITER_COLUMNS = (
-        "SELECT id, pid, started_at, heartbeat_at, ended_at, exit_kind, exit_code, "
+        "SELECT id, token, pid, started_at, heartbeat_at, ended_at, exit_kind, exit_code, "
         "detail, last_error, last_error_at FROM waiter_runs WHERE "
     )
+
+    def _waiter_run(self, row) -> dict | None:
+        """A run row with heartbeat_at raised to the mtime of the waiter's lock file
+        while the run is open; heartbeat_source says which reading it is."""
+        if row is None:
+            return None
+        run = dict(row)
+        source = "db"
+        if run["ended_at"] is None and run["token"] is not None:
+            run["heartbeat_at"], source = self._later(
+                run["heartbeat_at"], self._presence_mtime("waiter", run["token"])
+            )
+        run["heartbeat_source"] = source
+        return run
 
     def last_waiter(self, participant_id: str, token: str | None = None) -> dict | None:
         query = self._WAITER_COLUMNS + "participant_id=?"
@@ -496,17 +585,17 @@ class Store:
         if token is not None:
             query += " AND token=?"
             values += (token,)
-        row = self.db.execute(query + " ORDER BY id DESC LIMIT 1", values).fetchone()
-        return dict(row) if row is not None else None
+        return self._waiter_run(
+            self.db.execute(query + " ORDER BY id DESC LIMIT 1", values).fetchone()
+        )
 
     def last_waiter_for_token(self, token: str) -> dict | None:
         """An open run of this connection if any (a taken-over room closes only its
         own row), otherwise the most recently ended one."""
-        row = self.db.execute(
+        return self._waiter_run(self.db.execute(
             self._WAITER_COLUMNS + "token=? ORDER BY (ended_at IS NULL) DESC, ended_at DESC, id DESC LIMIT 1",
             (token,),
-        ).fetchone()
-        return dict(row) if row is not None else None
+        ).fetchone())
 
     def request_waiter(self, token: str, codex_thread: str) -> str:
         """Ask the server for a waiter; the id returned names this request alone."""
