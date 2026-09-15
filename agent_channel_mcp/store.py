@@ -493,12 +493,19 @@ class Store:
         """This store's own id, part of every delivery key it hands a receiver."""
         return self.db.execute("SELECT value FROM meta WHERE key='channel_id'").fetchone()["value"]
 
-    def mark_attempted(self, message_id: int) -> None:
+    def mark_attempted(self, message_id: int, token: str) -> bool:
         """Written before a delivery is handed to a receiver, so that a crash or a lost
         answer after the hand-over leaves the message marked: a marked message is only
-        ever looked for at the receiver, never added again."""
+        ever looked for at the receiver, never added again. Written only while this
+        connection still owns the recipient, in the same statement that checks it:
+        False when it does not, and then nothing is handed over."""
         with self.db:
-            self.db.execute("UPDATE messages SET attempted=1 WHERE id=?", (message_id,))
+            cursor = self.db.execute(
+                "UPDATE messages SET attempted=1 WHERE id=? AND recipient_id IN "
+                "(SELECT id FROM participants WHERE token=? AND left_at IS NULL)",
+                (message_id, token),
+            )
+        return cursor.rowcount == 1
 
     def attempted(self, message_id: int) -> bool:
         """Whether a delivery of the message may already have reached its receiver;

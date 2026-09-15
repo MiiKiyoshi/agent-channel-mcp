@@ -222,7 +222,7 @@ class Scenario:
 def accepted_response_lost(scenario: Scenario) -> dict:
     """The waiter marked the message and the app-server took it, but the answer never
     came back (the state a timeout or a crash leaves): the next attempt must find it."""
-    scenario.store.mark_attempted(scenario.message_id)
+    scenario.store.mark_attempted(scenario.message_id, "tok")
     sink = CodexSink(timeout=60)
     sink.add(scenario.thread_id, scenario.key, scenario.text)
     sink.close()
@@ -232,7 +232,7 @@ def accepted_response_lost(scenario: Scenario) -> dict:
 
 
 def consumed_before_retry(scenario: Scenario) -> dict:
-    scenario.store.mark_attempted(scenario.message_id)
+    scenario.store.mark_attempted(scenario.message_id, "tok")
     sink = CodexSink(timeout=60)
     sink.add(scenario.thread_id, scenario.key, scenario.text)
     sink.close()
@@ -266,7 +266,7 @@ def concurrent_retry(scenario: Scenario) -> dict:
         own = Store(scenario.db)
         sink = CodexSink(timeout=60)
         try:
-            return deliver_to_codex(own, sink, scenario.thread_id, message, scenario.text)
+            return deliver_to_codex(own, sink, scenario.thread_id, message, scenario.text, "tok")
         except DeliveryUncertain:
             return "uncertain"
         finally:
@@ -281,7 +281,7 @@ def concurrent_retry(scenario: Scenario) -> dict:
 
 def body_conflict(scenario: Scenario) -> dict:
     """The key is already held by other text: reported, never added, never acknowledged."""
-    scenario.store.mark_attempted(scenario.message_id)
+    scenario.store.mark_attempted(scenario.message_id, "tok")
     sink = CodexSink(timeout=60)
     sink.add(scenario.thread_id, scenario.key, "other text under the same key")
     sink.close()

@@ -31,6 +31,10 @@ class DeliveryUncertain(Exception):
     """The message was handed over once, and is in neither the queue nor the items."""
 
 
+class DeliveryNotOwned(Exception):
+    """The recipient was taken over by another connection since the message was read."""
+
+
 class WaiterSignal(Exception):
     def __init__(self, signum: int):
         self.signum = signum
@@ -96,18 +100,25 @@ def delivery_lock(db: Path, thread_id: str):
     return handle
 
 
-def deliver_to_codex(store: Store, sink: CodexSink, thread_id: str, message: dict, text: str) -> str:
+def deliver_to_codex(store: Store, sink: CodexSink, thread_id: str, message: dict, text: str,
+                     token: str) -> str:
     """Put one message on its thread at most once: "added", or "queued"/"consumed"
     when a delivery under its key is already there. Raises KeyConflict, DeliveryUncertain,
-    SinkUnsupported, SinkTransportError or SinkError, each leaving the message
-    unacknowledged.
+    DeliveryNotOwned, SinkUnsupported, SinkTransportError or SinkError, each leaving
+    the message unacknowledged.
 
     The message is marked attempted, durably, before it is handed over, and a marked
     message is never added again: the thread's queue and items are read for its key,
     and a message in neither is uncertain, since the app-server deletes a queued
     message when its turn starts and records the item only later. The mark is cleared
     when the app-server answers that it did not take the message; a hand-over with no
-    answer keeps it."""
+    answer keeps it.
+
+    The mark is written only while `token` still owns the recipient, in the statement
+    that checks it, so a waiter whose role was taken over after it read the message
+    hands nothing over. A takeover between that write and the add is not caught: the
+    add then goes to the old thread, and the new waiter, seeing the mark, looks for
+    the message in its own thread and reports it uncertain."""
     key = f"agent-channel:{store.channel_id}:{message['id']}"
     handle = delivery_lock(store.path, thread_id)
     try:
@@ -117,7 +128,8 @@ def deliver_to_codex(store: Store, sink: CodexSink, thread_id: str, message: dic
             if found is None:
                 raise DeliveryUncertain(f"delivery uncertain for message {message['id']}; not re-adding")
             return found
-        store.mark_attempted(message["id"])
+        if not store.mark_attempted(message["id"], token):
+            raise DeliveryNotOwned(f"message {message['id']} is no longer this connection's to deliver")
         try:
             sink.add(thread_id, key, text)
         except SinkError:                        # answered: the message was not taken
@@ -141,6 +153,16 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                 store.waiter_started(participant_id, token, os.getpid())
             next_heartbeat = time.monotonic()
             reported_error = None
+            recorded_error = None                     # the detail last written to the run row
+
+            def record(detail: str) -> None:
+                # The run row carries the failure once; a repeat of the same detail
+                # (an uncertain message looked for again, an app-server still absent)
+                # is not another write.
+                nonlocal recorded_error
+                if detail != recorded_error:
+                    store.waiter_error(token, detail)
+                    recorded_error = detail
             sink: CodexSink | None = None
             conflicted: set[int] = set()
             uncertain: dict[int, float] = {}          # message id -> when to look again
@@ -173,14 +195,18 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                             try:
                                 if sink is None:
                                     sink = CodexSink(timeout=CODEX_QUEUE_TIMEOUT_SECONDS, stop=stop)
-                                deliver_to_codex(store, sink, codex_thread, message, text)
+                                deliver_to_codex(store, sink, codex_thread, message, text, token)
+                            except DeliveryNotOwned:
+                                # Taken over since the message was read: nothing handed
+                                # over; the next round finds the token inactive and ends.
+                                continue
                             except KeyConflict as conflict:
                                 # Permanent: the key is taken by other text. Not acknowledged,
                                 # not added, not tried again; said once and left to a person.
                                 conflicted.add(message["id"])
                                 uncertain.pop(message["id"], None)
                                 detail = f"key conflict for message {message['id']}: {conflict}"
-                                store.waiter_error(token, detail)
+                                record(detail)
                                 print(detail, file=sys.stderr, flush=True)
                                 continue
                             except DeliveryUncertain as why:
@@ -188,14 +214,14 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                                 # acknowledged; looked for again later, said once.
                                 first = message["id"] not in uncertain
                                 uncertain[message["id"]] = time.monotonic() + CODEX_UNCERTAIN_PAUSE_SECONDS
-                                store.waiter_error(token, str(why))
+                                record(str(why))
                                 if first:
                                     print(why, file=sys.stderr, flush=True)
                                 continue
                             except SinkUnsupported as unsupported:
                                 # No safe way to deliver: nothing is sent, and why is on record.
                                 detail = f"codex app-server queue API unsupported: {unsupported}"
-                                store.waiter_error(token, detail)
+                                record(detail)
                                 if detail != reported_error:
                                     print(detail, file=sys.stderr, flush=True)
                                     reported_error = detail
@@ -208,7 +234,7 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                                 # The answer is lost or refused; the message stays marked and
                                 # unacknowledged, and the next attempt reads before it adds.
                                 detail = f"codex app-server {error} for message {message['id']}"
-                                store.waiter_error(token, detail)
+                                record(detail)
                                 if detail != reported_error:
                                     print(
                                         f"Delivery failed for message {message['id']}; "
@@ -225,6 +251,7 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                         store.ack_for_token(token, message["id"])
                         uncertain.pop(message["id"], None)
                         reported_error = None
+                        recorded_error = None
                     except sqlite3.OperationalError as error:
                         # Another process holds the database. Keep serving; a message
                         # delivered before a busy ack is repeated and deduplicated by id.
