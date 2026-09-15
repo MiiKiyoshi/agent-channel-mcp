@@ -6,6 +6,7 @@ import os
 import signal
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -23,8 +24,21 @@ class WaiterSignal(Exception):
         self.signum = signum
 
 
+def _open_lock_file(path: Path, flags: int):
+    """The lock file itself, never a link followed to another file and never a
+    special file, checked on the descriptor that is then used."""
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a regular file")
+    except BaseException:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, "r+")
+
+
 def lock(path: Path, owner: str):
-    handle = path.open("a+")
+    handle = _open_lock_file(path, os.O_RDWR | os.O_CREAT)
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -174,8 +188,8 @@ def run(db: Path, token: str, codex_thread: str | None = None,
 
 def lock_owned(path: Path, owner: str) -> bool:
     try:
-        handle = path.open("r+")
-    except FileNotFoundError:
+        handle = _open_lock_file(path, os.O_RDWR)
+    except OSError:                      # absent, a link, or not a plain file: not ours
         return False
     try:
         try:

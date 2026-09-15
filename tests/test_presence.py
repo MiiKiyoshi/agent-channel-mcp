@@ -106,6 +106,71 @@ def test_a_store_from_a_newer_code_is_refused(tmp_path):
         Store(db)
 
 
+def test_a_version_raised_between_the_first_read_and_the_write_lock_is_refused(tmp_path, monkeypatch):
+    """Another process brings the store to a newer version after this one read 0 and
+    before it took the write lock: the setup must not run and lower the version."""
+    db = tmp_path / "db"
+    store = Store(db)
+    store.db.execute("PRAGMA user_version = 0")
+    store.close()
+    real_connect = sqlite3.connect
+    opened = []
+
+    class RaisedMeanwhile(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if sql == "BEGIN IMMEDIATE" and not opened:
+                opened.append(True)
+                other = real_connect(db)
+                other.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+                other.close()
+            return super().execute(sql, *args)
+
+    monkeypatch.setattr(sqlite3, "connect", lambda *a, **k: real_connect(*a, factory=RaisedMeanwhile, **k))
+    with pytest.raises(RuntimeError, match="schema version"):
+        Store(db)
+    monkeypatch.undo()
+    with sqlite3.connect(db) as check:
+        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION + 1
+
+
+def test_a_presence_path_that_is_a_link_or_not_a_plain_file_is_refused(tmp_path):
+    db = tmp_path / "db"
+    store = Store(db)
+    participant = store.participant("room", "exec")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_text("not ours")
+    _age(elsewhere, 1)
+    link = store._presence_path("connection", "linked")
+    link.symlink_to(elsewhere)
+    with pytest.raises(OSError):
+        store._presence_touch("connection", "linked")
+    assert int(elsewhere.stat().st_mtime) == 1                 # the target was not touched
+    assert store._presence_mtime("connection", "linked") is None
+    with store.db:
+        store.db.execute("UPDATE participants SET token='linked' WHERE id=?", (participant["id"],))
+    _age(elsewhere, int(time.time()))                          # even a fresh target
+    assert store.role_statuses("room")[0]["connection"] == "offline"
+    store._presence_path("connection", "dirtoken").mkdir()
+    with pytest.raises(OSError):
+        store._presence_touch("connection", "dirtoken")
+    assert store._presence_mtime("connection", "dirtoken") is None
+    store.close()
+
+
+def test_a_waiter_lock_path_that_is_a_link_is_refused_and_its_target_untouched(tmp_path):
+    from agent_channel_mcp.waiter import lock, lock_owned, lock_path
+    db = tmp_path / "db"
+    Store(db).close()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_text("linked-token")
+    _age(elsewhere, 1)
+    lock_path(db, "linked-token").symlink_to(elsewhere)
+    with pytest.raises(OSError):
+        lock(lock_path(db, "linked-token"), "linked-token")
+    assert elsewhere.read_text() == "linked-token" and int(elsewhere.stat().st_mtime) == 1
+    assert lock_owned(lock_path(db, "linked-token"), "linked-token") is False
+
+
 # Telling liveness from the files.
 
 def test_presence_is_the_later_of_the_file_and_the_column_for_that_token_only(tmp_path):
