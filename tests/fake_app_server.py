@@ -14,6 +14,8 @@ sees them. Its failures are knobs in that file, changeable while a sink is runni
   hang: no request is answered
   unsupported: the queue methods answer "requires experimentalApi capability"
   child: a shell command to leave running as a child, for cleanup tests
+  page_size: entries per page of thread/queue/list and thread/items/list (default: all)
+  cursor_cycle: every page names the same nextCursor, so the listing never ends
 It is not the app-server; the gap between queue and items is a state here, not a race.
 """
 
@@ -48,6 +50,17 @@ def thread_state(state: dict, thread_id: str) -> dict:
 def as_item(submission: dict) -> dict:
     return {"type": "userMessage", "id": submission["id"], "clientId": submission["clientUserMessageId"],
             "content": submission["input"]}
+
+
+def page(entries: list, params: dict, knobs: dict) -> dict:
+    """One page of `entries` from the cursor in `params`, sized by the page_size knob."""
+    size = knobs.get("page_size") or len(entries) or 1
+    if knobs.get("cursor_cycle"):
+        return {"data": entries[:size], "nextCursor": "again"}
+    start = int(params.get("cursor") or 0)
+    following = start + size
+    return {"data": entries[start:following],
+            "nextCursor": str(following) if following < len(entries) else None}
 
 
 def answer(message: dict, result=None, error=None) -> None:
@@ -88,10 +101,10 @@ def main() -> None:
             continue
         thread = thread_state(state, params.get("threadId", ""))
         if method == "thread/queue/list":
-            answer(message, {"data": list(thread["queue"]), "nextCursor": None})
+            answer(message, page(list(thread["queue"]), params, knobs))
         elif method == "thread/items/list":
             items = list(reversed(thread["items"])) if params.get("sortDirection") == "desc" else list(thread["items"])
-            answer(message, {"data": [{"item": item} for item in items], "nextCursor": None})
+            answer(message, page([{"item": item} for item in items], params, knobs))
         elif method == "thread/queue/add":
             if knobs.get("add_error"):
                 answer(message, error={"code": -32600, "message": knobs["add_error"]})

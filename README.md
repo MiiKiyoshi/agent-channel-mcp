@@ -38,6 +38,10 @@ Ask the agent to send directly with `send(text="...", to="exec")`; omitting `to`
 
 A newly joined agent sends to the room's `plan` first, when the room has one. `plan` answers with the current state, the settled contracts, the assets in hand, and the tasks that fall to the new role. Deliveries begin with `id room sender`. Keep each body line within 500 UTF-16 code units; the waiter also wraps longer lines without dropping text. A peer directs work only when the user explicitly delegated authority to that role; the briefing from `plan` is under the same rule.
 
+## Upgrade
+
+A database from an earlier version is brought up to date when it is next opened. Messages that were still unacknowledged at that moment are marked as handed over once, since an earlier delivery may already have reached the receiver without a key to recognise it by: they are looked for, not added, and one that is not found stays pending as "delivery uncertain" until a person sends it again.
+
 ## Restart or reconnect
 
 After either harness, client, or server restarts, tell the agent to join each of its rooms again and follow the live-status procedure above; the previous connection's room list is not restored automatically, and never assume its waiter survived. Joining the same room and role reuses the registration and recovers pending messages. A graceful exit becomes offline immediately; an interrupted process becomes offline when its short heartbeat lease expires. `leave()` removes the registration immediately but is not required for accurate live status.

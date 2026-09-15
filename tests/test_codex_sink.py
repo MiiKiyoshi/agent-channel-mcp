@@ -2,6 +2,9 @@
 of a second add, the uncertain state, the conflict, the unsupported API, and the lock
 between two waiters."""
 
+import os
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -9,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from agent_channel_mcp import waiter as waiter_module
-from agent_channel_mcp.codex_sink import CodexSink, KeyConflict, SinkError, SinkUnsupported
+from agent_channel_mcp.codex_sink import CodexSink, KeyConflict, SinkError, SinkTransportError, SinkUnsupported
 from agent_channel_mcp.store import Store
 from agent_channel_mcp.waiter import DeliveryNotOwned, DeliveryUncertain, deliver_to_codex, render_message
 from fake_app_server import FakeCodex
@@ -38,6 +41,20 @@ def _run_waiter(db, stop):
     thread = threading.Thread(target=waiter_module.run, args=(db, "tok", "thread-1", stop), daemon=True)
     thread.start()
     return thread
+
+
+# The pending pick with many excluded ids: one SQL variable, however many.
+
+def test_the_pending_pick_skips_any_number_of_excluded_ids(tmp_path):
+    store = Store(tmp_path / "db")
+    plan = store.participant("room", "plan")
+    execute = store.participant("room", "exec")
+    store.activate(execute["id"], "tok")
+    ids = [store.send(plan["id"], f"m{index}", to="exec")[0]["message_id"] for index in range(1201)]
+    assert store.pending_for_token("tok", excluding=set(ids[:1200]))["id"] == ids[1200]
+    assert store.pending_for_token("tok", excluding=set(ids)) is None
+    assert store.pending_for_token("tok")["id"] == ids[0]
+    store.close()
 
 
 # The key and the look before the add.
@@ -100,7 +117,7 @@ def test_a_marked_message_found_nowhere_is_not_added_again_and_is_acknowledged_o
         run = wait_for(lambda: (
             (run := store.last_waiter(receiver["id"], "tok")) and run["last_error"]
             and "uncertain" in run["last_error"] and run
-        ))
+        ), timeout=12)
         assert run["last_error"] == f"delivery uncertain for message {message_id}; not re-adding"
         time.sleep(1.0)                                                      # several looks
         assert codex.requests().count("thread/queue/add") == 1
@@ -111,11 +128,11 @@ def test_a_marked_message_found_nowhere_is_not_added_again_and_is_acknowledged_o
         # meets the same failure; here the add answers again.
         codex.set(drop_add_response=None, consume="immediate")
         later = store.send(store.participant("room", "plan")["id"], "later", to="exec")[0]["message_id"]
-        wait_for(lambda: f"{later} room plan\nlater" in codex.texts("thread-1"))
+        wait_for(lambda: f"{later} room plan\nlater" in codex.texts("thread-1"), timeout=12)
         assert store.pending(receiver["id"])["id"] == message_id            # still first, still unacknowledged
         # The item becomes visible: the next look acknowledges, with no add.
         codex.arrive("thread-1")
-        wait_for(lambda: store.pending(receiver["id"]) is None)
+        wait_for(lambda: store.pending(receiver["id"]) is None, timeout=12)
         assert codex.requests().count("thread/queue/add") == 2               # one per message
         assert sorted(codex.texts("thread-1")) == sorted([f"{later} room plan\nlater", f"{message_id} room plan\nhello"])
     finally:
@@ -156,6 +173,44 @@ def test_a_marked_message_that_never_appears_stays_pending_and_uncertain(tmp_pat
         store.close()
 
 
+def test_two_uncertain_messages_and_a_later_acknowledgement_write_nothing_more(tmp_path, monkeypatch):
+    """Both doubts are written once; the looks that follow, alternating between the
+    two, and the acknowledgement of a later message in between, add no write."""
+    monkeypatch.setattr(waiter_module, "CODEX_QUEUE_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(waiter_module, "CODEX_RETRY_PAUSE_SECONDS", 0.2)
+    monkeypatch.setattr(waiter_module, "CODEX_UNCERTAIN_PAUSE_SECONDS", 0.2)
+    codex = FakeCodex(tmp_path / "bin", consume="in_transit", drop_add_response=True).apply(monkeypatch)
+    store, receiver, first = _store_with_message(tmp_path / "db", "one")
+    plan = store.participant("room", "plan")
+    second = store.send(plan["id"], "two", to="exec")[0]["message_id"]
+    stop = threading.Event()
+    thread = _run_waiter(tmp_path / "db", stop)
+    try:
+        wait_for(lambda: len(codex.transit("thread-1")) == 2, timeout=12)          # both handed over once
+        wait_for(lambda: (
+            (run := store.last_waiter(receiver["id"], "tok")) and run["last_error"]
+            == f"delivery uncertain for message {second}; not re-adding"
+        ), timeout=12)
+        codex.set(drop_add_response=None, consume="immediate")
+        later = store.send(plan["id"], "three", to="exec")[0]["message_id"]
+        wait_for(lambda: store.pending(receiver["id"]) is not None
+                 and f"{later} room plan\nthree" in codex.texts("thread-1")
+                 and store.pending_for_token("tok", excluding={first, second}) is None)
+        watcher = Store(tmp_path / "db")
+        version = watcher.db.execute("PRAGMA data_version").fetchone()[0]
+        looks = codex.requests().count("thread/items/list")
+        wait_for(lambda: codex.requests().count("thread/items/list") >= looks + 6, timeout=12)   # >= 3 per message
+        assert watcher.db.execute("PRAGMA data_version").fetchone()[0] == version
+        watcher.close()
+        assert codex.requests().count("thread/queue/add") == 3                       # each id once
+        assert store.pending(receiver["id"])["id"] == first
+        assert store.pending_for_token("tok", excluding={first})["id"] == second
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+        store.close()
+
+
 def test_the_delivery_raises_uncertain_for_a_marked_message_found_nowhere(tmp_path, monkeypatch):
     FakeCodex(tmp_path / "bin").apply(monkeypatch)
     store, receiver, message_id = _store_with_message(tmp_path / "db")
@@ -186,6 +241,158 @@ def test_an_answered_refusal_clears_the_mark_so_the_next_attempt_may_add(tmp_pat
         sink.close()
     assert codex.requests().count("thread/queue/add") == 2
     store.close()
+
+
+# The delivery lock held elsewhere: a stop ends the wait, a deadline bounds it.
+
+def _hold_delivery_lock(db) -> subprocess.Popen:
+    """Another process holding thread-1's delivery lock until it is killed."""
+    script = (
+        "import fcntl, sys, time\n"
+        "handle = open(sys.argv[1], 'a+')\n"
+        "fcntl.flock(handle, fcntl.LOCK_EX)\n"
+        "print('held', flush=True)\n"
+        "time.sleep(600)\n"
+    )
+    holder = subprocess.Popen([sys.executable, "-c", script, f"{db}.thread-1.deliver.lock"],
+                              stdout=subprocess.PIPE, text=True)
+    assert holder.stdout.readline().strip() == "held"
+    return holder
+
+
+def _marker() -> str:
+    return f"sleep {30 + os.getpid() % 7}.{os.getpid() % 100:02d}"
+
+
+def _still_running(marker: str) -> bool:
+    return subprocess.run(["pgrep", "-f", f"^{marker}$"], capture_output=True, text=True).stdout.strip() != ""
+
+
+def test_a_stop_while_waiting_for_the_delivery_lock_ends_the_waiter_and_its_app_server_at_once(
+    tmp_path, monkeypatch
+):
+    marker = _marker()
+    codex = FakeCodex(tmp_path / "bin", child=marker).apply(monkeypatch)
+    store, receiver, message_id = _store_with_message(tmp_path / "db")
+    holder = _hold_delivery_lock(tmp_path / "db")
+    stop = threading.Event()
+    thread = _run_waiter(tmp_path / "db", stop)
+    try:
+        wait_for(lambda: "initialize" in codex.requests() and _still_running(marker))
+        time.sleep(0.5)                                              # now waiting for the lock
+        assert codex.requests().count("thread/queue/add") == 0
+        started = time.monotonic()
+        stop.set()
+        thread.join(timeout=1.0)
+        assert not thread.is_alive() and time.monotonic() - started < 1.0
+        wait_for(lambda: not _still_running(marker), timeout=3)      # the child app-server is gone
+        assert store.pending_for_token("tok")["attempted"] == 0
+        assert codex.requests().count("thread/queue/add") == 0
+        assert store.last_waiter(receiver["id"], "tok")["detail"] == "stopped by the server"
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)
+        holder.stdout.close()
+        stop.set()
+        thread.join(timeout=5)
+    # The lock is free: a waiter delivers the message once.
+    stop = threading.Event()
+    thread = _run_waiter(tmp_path / "db", stop)
+    try:
+        wait_for(lambda: store.pending(receiver["id"]) is None)
+        assert codex.texts("thread-1") == [f"{message_id} room plan\nhello"]
+        assert codex.requests().count("thread/queue/add") == 1
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+        store.close()
+
+
+def test_a_delivery_lock_held_too_long_is_an_error_the_waiter_survives(tmp_path, monkeypatch):
+    monkeypatch.setattr(waiter_module, "CODEX_LOCK_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(waiter_module, "CODEX_RETRY_PAUSE_SECONDS", 0.2)
+    codex = FakeCodex(tmp_path / "bin").apply(monkeypatch)
+    store, receiver, message_id = _store_with_message(tmp_path / "db")
+    holder = _hold_delivery_lock(tmp_path / "db")
+    stop = threading.Event()
+    thread = _run_waiter(tmp_path / "db", stop)
+    try:
+        run = wait_for(lambda: (
+            (run := store.last_waiter(receiver["id"], "tok")) and run["last_error"] and run
+        ))
+        assert run["last_error"] == (
+            f"codex app-server delivery lock for thread thread-1 held elsewhere for 0.5 s for message {message_id}"
+        )
+        assert thread.is_alive() and run["ended_at"] is None
+        assert store.pending_for_token("tok")["attempted"] == 0
+        assert codex.requests().count("thread/queue/add") == 0
+        holder.kill()
+        holder.wait(timeout=5)
+        wait_for(lambda: store.pending(receiver["id"]) is None)
+        assert codex.requests().count("thread/queue/add") == 1
+    finally:
+        holder.stdout.close()
+        if holder.poll() is None:
+            holder.kill()
+        stop.set()
+        thread.join(timeout=5)
+        store.close()
+
+
+def test_the_lock_wait_stops_without_a_mark(tmp_path, monkeypatch):
+    FakeCodex(tmp_path / "bin").apply(monkeypatch)
+    store, receiver, message_id = _store_with_message(tmp_path / "db")
+    holder = _hold_delivery_lock(tmp_path / "db")
+    stop = threading.Event()
+    sink = CodexSink(timeout=5, stop=stop)
+    message = store.pending_for_token("tok")
+    threading.Timer(0.3, stop.set).start()
+    try:
+        with pytest.raises(SinkTransportError, match="stopped before the delivery lock"):
+            deliver_to_codex(store, sink, "thread-1", message, render_message(message), "tok")
+    finally:
+        sink.close()
+        holder.kill()
+        holder.wait(timeout=5)
+        holder.stdout.close()
+    assert store.pending_for_token("tok")["attempted"] == 0
+    store.close()
+
+
+# Pagination: the look stops at the first match, reads every page when there is none,
+# and does not follow a cursor that repeats.
+
+def test_the_look_reads_no_page_past_the_first_match(tmp_path, monkeypatch):
+    codex = FakeCodex(tmp_path / "bin", page_size=2).apply(monkeypatch)
+    sink = CodexSink(timeout=5)
+    try:
+        for index in range(5):
+            sink.add("thread-1", f"k{index}", f"t{index}")
+        before = codex.requests().count("thread/items/list")
+        assert sink.find("thread-1", "k4", "t4") == "consumed"         # newest first: page one
+        assert codex.requests().count("thread/items/list") == before + 1
+        before = codex.requests().count("thread/items/list")
+        assert sink.find("thread-1", "k0", "t0") == "consumed"         # the last page
+        assert codex.requests().count("thread/items/list") == before + 3
+        before = codex.requests().count("thread/items/list")
+        assert sink.find("thread-1", "absent", "t") is None            # every page
+        assert codex.requests().count("thread/items/list") == before + 3
+    finally:
+        sink.close()
+
+
+def test_a_listing_whose_cursor_repeats_is_a_bounded_error(tmp_path, monkeypatch):
+    codex = FakeCodex(tmp_path / "bin", page_size=1, cursor_cycle=True).apply(monkeypatch)
+    sink = CodexSink(timeout=5)
+    try:
+        sink.add("thread-1", "k0", "t0")
+        sink.add("thread-1", "k1", "t1")
+        with pytest.raises(SinkError, match="repeats cursor"):
+            sink.find("thread-1", "absent", "t")
+        assert codex.requests().count("thread/queue/list") == 2         # the page, and the page again
+        assert codex.requests().count("thread/items/list") == 0         # not reached
+    finally:
+        sink.close()
 
 
 # A takeover between reading the message and handing it over.
