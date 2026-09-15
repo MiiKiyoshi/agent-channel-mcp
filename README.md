@@ -46,9 +46,11 @@ After either harness, client, or server restarts, tell the agent to join each of
 
 - **Recipient not found:** ask that agent to join the room, then tell the sending agent to call `join` again to refresh registered roles and live status.
 - **Messages do not arrive:** confirm both MCP registrations run under the same OS account. If either uses `--db`, both must use the same absolute path.
-- **Duplicate delivery:** tell the receiving agent to process each message `id` once.
+- **Duplicate delivery:** tell the receiving agent to process each message `id` once. A Codex thread receives each message once: the waiter queues it under the key `agent-channel:<channel id>:<message id>` through a stock `codex app-server` child, and before any retry it reads the thread's queue and items for that key.
+- **Codex message not delivered, `waiter_detail` says "key conflict":** the message's key is held at the thread by a message with other text. It is not queued and not acknowledged; a person decides.
+- **`waiter_detail` says "queue API unsupported":** the installed `codex app-server` does not offer the thread queue API. Nothing is delivered to Codex until a Codex with that API is installed.
 - **Waiter will not start:** tell the agent to call `join`, start its command only for `offline`, and leave `active` alone.
-- **Waiter disappeared:** inspect `waiter_detail` from `join`. It records normal token shutdowns, signals, runtime errors, last heartbeat, and any failed `codex queue` attempt. An abrupt kill becomes offline when its heartbeat lease expires.
+- **Waiter disappeared:** inspect `waiter_detail` from `join`. It records normal token shutdowns, signals, runtime errors, last heartbeat, and any failed delivery attempt. An abrupt kill becomes offline when its heartbeat lease expires.
 
 ## Test and contribute
 
@@ -59,4 +61,4 @@ uv sync --extra dev
 uv run --no-sync pytest -q
 ```
 
-Tests use temporary databases and a fake Codex executable. Live delivery checks require both real harnesses to be connected.
+Tests use temporary databases and a fake `codex app-server`; the installed Codex is exercised in a private network namespace where `codex` and `unshare` are available. Live delivery checks require both real harnesses to be connected.
