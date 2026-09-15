@@ -223,6 +223,11 @@ def test_stale_registered_roles_are_reported_offline(tmp_path):
         store.db.execute(
             "UPDATE waiter_runs SET heartbeat_at=? WHERE id=?", (stale, write_run)
         )
+    # Presence also lives in files beside the database; age those the same way.
+    for token in ("research-token", "write-token"):
+        os.utime(store._presence_path("connection", token), (stale, stale))
+    store._presence_touch("waiter", "write-token")
+    os.utime(store._presence_path("waiter", "write-token"), (stale, stale))
 
     assert store.registered_roles("room") == ["active", "research", "write"]
     assert store.role_statuses("room", now=now) == [
@@ -516,6 +521,8 @@ def test_waiter_records_signal_exit_and_join_reports_abrupt_loss(tmp_path):
                 "UPDATE waiter_runs SET heartbeat_at=? WHERE id=?",
                 (stale_heartbeat, replacement_run["id"]),
             )
+        os.utime(channel.store._presence_path("waiter", channel.token),
+                 (stale_heartbeat, stale_heartbeat))     # the lock file the waiter touched
         status = channel.join("room", "plan")
         assert status["waiter"] == "offline"
         assert status["waiter_detail"]["reason"] == "heartbeat lease expired"

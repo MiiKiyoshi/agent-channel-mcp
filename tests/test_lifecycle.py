@@ -58,11 +58,13 @@ def _codex_stub(directory: Path, *, exit_code: int = 0, sleep: float = 0) -> Pat
     return executable
 
 
-def _heartbeat_of(db: Path, participant_id: str) -> int:
-    with sqlite3.connect(db) as connection:
-        return connection.execute(
-            "SELECT connection_heartbeat_at FROM participants WHERE id=?", (participant_id,)
-        ).fetchone()[0]
+def _heartbeat_of(db: Path, token: str) -> int:
+    """When the connection was last seen: its presence file beside the database."""
+    store = Store(db)
+    try:
+        return store.connection_seen_at(token) or 0
+    finally:
+        store.close()
 
 
 def _waiter_command(db: Path, token: str) -> list[str]:
@@ -77,8 +79,8 @@ def test_the_heartbeat_thread_waits_out_a_lock_held_longer_than_its_connection_w
     monkeypatch.setattr(server_module, "HEARTBEAT_INTERVAL_SECONDS", 1)
     db = tmp_path / "db"
     channel = Channel(db)
-    joined = channel.join("room", "exec", "claude")
-    participant = joined["participant"]["id"]
+    channel.join("room", "exec", "claude")
+    participant = channel.token
     thread = channel.connection_thread
     holder = _hold_write_lock(db, 12)                 # longer than the 10 s a connection waits
     try:
@@ -104,14 +106,15 @@ def test_the_heartbeat_thread_ends_on_a_permanent_error_and_join_reports_it(
     channel = Channel(db)
     channel.join("room", "exec", "claude")
     thread = channel.connection_thread
-    db.chmod(0o444)                                   # the thread's own connection opens read-only
+    time.sleep(1.5)                                   # the thread has opened its store and beaten once
+    db.parent.chmod(0o000)                            # the presence file can no longer be touched
     try:
         wait_for(lambda: not thread.is_alive(), timeout=8)
     finally:
-        db.chmod(0o600)
-    assert "readonly" in channel.connection_failure
+        db.parent.chmod(0o700)
+    assert "PermissionError" in channel.connection_failure
     reported = channel.join("room", "exec", "claude")
-    assert "readonly" in reported["thread_failures"]["connection"]
+    assert "PermissionError" in reported["thread_failures"]["connection"]
     channel.close()
 
 

@@ -193,10 +193,10 @@ def test_abrupt_client_exit_becomes_offline_after_connection_lease(tmp_path):
 
         store = Store(path)
         try:
-            heartbeat = store.db.execute(
-                "SELECT connection_heartbeat_at FROM participants WHERE id=?",
-                (joined["participant"]["id"],),
-            ).fetchone()["connection_heartbeat_at"]
+            token = store.db.execute(
+                "SELECT token FROM participants WHERE id=?", (joined["participant"]["id"],)
+            ).fetchone()["token"]
+            heartbeat = store.connection_seen_at(token)     # its presence file, or the column
             assert store.role_statuses("room", now=heartbeat) == [
                 {"name": "research", "connection": "active", "waiter": "offline"}
             ]
