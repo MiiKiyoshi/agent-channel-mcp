@@ -11,7 +11,7 @@ import pytest
 from agent_channel_mcp import waiter as waiter_module
 from agent_channel_mcp.codex_sink import CodexSink, KeyConflict, SinkError, SinkUnsupported
 from agent_channel_mcp.store import Store
-from agent_channel_mcp.waiter import DeliveryUncertain, deliver_to_codex, render_message
+from agent_channel_mcp.waiter import DeliveryNotOwned, DeliveryUncertain, deliver_to_codex, render_message
 from fake_app_server import FakeCodex
 
 
@@ -49,7 +49,7 @@ def test_a_first_attempt_adds_without_reading_and_marks_the_message(tmp_path, mo
     assert message["attempted"] == 0
     sink = CodexSink(timeout=5)
     try:
-        assert deliver_to_codex(store, sink, "thread-1", message, render_message(message)) == "added"
+        assert deliver_to_codex(store, sink, "thread-1", message, render_message(message), "tok") == "added"
     finally:
         sink.close()
     assert codex.requests() == ["initialize", "thread/queue/add"]
@@ -65,17 +65,17 @@ def test_a_repeated_attempt_finds_the_message_and_does_not_add_it_again(tmp_path
     text = render_message(message)
     sink = CodexSink(timeout=5)
     try:
-        deliver_to_codex(store, sink, "thread-1", message, text)
+        deliver_to_codex(store, sink, "thread-1", message, text, "tok")
         message = store.pending_for_token("tok")                      # still unacknowledged, now marked
-        assert deliver_to_codex(store, sink, "thread-1", message, text) == "consumed"
+        assert deliver_to_codex(store, sink, "thread-1", message, text, "tok") == "consumed"
         codex.set(consume="never")
         other = store.send(store.participant("room", "plan")["id"], "second", to="exec")[0]["message_id"]
         store.ack_for_token("tok", message_id)
         second = store.pending_for_token("tok")
         assert second["id"] == other
-        deliver_to_codex(store, sink, "thread-1", second, render_message(second))
+        deliver_to_codex(store, sink, "thread-1", second, render_message(second), "tok")
         second = store.pending_for_token("tok")
-        assert deliver_to_codex(store, sink, "thread-1", second, render_message(second)) == "queued"
+        assert deliver_to_codex(store, sink, "thread-1", second, render_message(second), "tok") == "queued"
     finally:
         sink.close()
     assert codex.requests().count("thread/queue/add") == 2
@@ -137,7 +137,14 @@ def test_a_marked_message_that_never_appears_stays_pending_and_uncertain(tmp_pat
             (run := store.last_waiter(receiver["id"], "tok")) and run["last_error"]
             and "uncertain" in run["last_error"]
         ))
+        # From the first note on, the looks write nothing to the database.
+        watcher = Store(tmp_path / "db")
+        version = watcher.db.execute("PRAGMA data_version").fetchone()[0]
+        looks = codex.requests().count("thread/items/list")
         time.sleep(2.0)
+        assert codex.requests().count("thread/items/list") >= looks + 3
+        assert watcher.db.execute("PRAGMA data_version").fetchone()[0] == version
+        watcher.close()
         assert codex.requests().count("thread/queue/add") == 1
         assert store.pending(receiver["id"])["id"] == message_id
         assert store.last_waiter(receiver["id"], "tok")["last_error"] == (
@@ -152,12 +159,12 @@ def test_a_marked_message_that_never_appears_stays_pending_and_uncertain(tmp_pat
 def test_the_delivery_raises_uncertain_for_a_marked_message_found_nowhere(tmp_path, monkeypatch):
     FakeCodex(tmp_path / "bin").apply(monkeypatch)
     store, receiver, message_id = _store_with_message(tmp_path / "db")
-    store.mark_attempted(message_id)
+    store.mark_attempted(message_id, "tok")
     message = store.pending_for_token("tok")
     sink = CodexSink(timeout=5)
     try:
         with pytest.raises(DeliveryUncertain, match=f"message {message_id}; not re-adding"):
-            deliver_to_codex(store, sink, "thread-1", message, render_message(message))
+            deliver_to_codex(store, sink, "thread-1", message, render_message(message), "tok")
     finally:
         sink.close()
     store.close()
@@ -170,14 +177,69 @@ def test_an_answered_refusal_clears_the_mark_so_the_next_attempt_may_add(tmp_pat
     sink = CodexSink(timeout=5)
     try:
         with pytest.raises(SinkError, match="thread is busy"):
-            deliver_to_codex(store, sink, "thread-1", message, render_message(message))
+            deliver_to_codex(store, sink, "thread-1", message, render_message(message), "tok")
         assert store.pending_for_token("tok")["attempted"] == 0
         codex.set(add_error=None)
         assert deliver_to_codex(store, sink, "thread-1", store.pending_for_token("tok"),
-                                render_message(message)) == "added"
+                                render_message(message), "tok") == "added"
     finally:
         sink.close()
     assert codex.requests().count("thread/queue/add") == 2
+    store.close()
+
+
+# A takeover between reading the message and handing it over.
+
+def test_a_waiter_taken_over_after_reading_the_message_hands_nothing_over(tmp_path, monkeypatch):
+    """The old waiter has the message in hand when the role moves to a new connection;
+    its mark is refused, it adds nothing to its thread, and the new waiter, seeing no
+    mark, delivers the message to the new thread."""
+    codex = FakeCodex(tmp_path / "bin").apply(monkeypatch)
+    store, receiver, message_id = _store_with_message(tmp_path / "db")
+    taken_over = threading.Event()
+
+    class TakenOverAtTheGate(Store):
+        def attempted(self, message_id):
+            if not taken_over.is_set():          # under the delivery lock, just before the mark
+                Store(tmp_path / "db").activate(receiver["id"], "tok-2")
+                taken_over.set()
+            return super().attempted(message_id)
+
+    monkeypatch.setattr(waiter_module, "Store", TakenOverAtTheGate)
+    exit_code = waiter_module.run(tmp_path / "db", "tok", "thread-1", threading.Event())
+    assert exit_code == 0 and taken_over.is_set()
+    assert store.last_waiter(receiver["id"], "tok")["detail"] == "token inactive"
+    assert codex.requests().count("thread/queue/add") == 0
+    assert codex.texts("thread-1") == []
+    assert store.pending(receiver["id"])["id"] == message_id
+    assert store.pending_for_token("tok-2")["attempted"] == 0
+    monkeypatch.setattr(waiter_module, "Store", Store)
+    stop = threading.Event()
+    thread = threading.Thread(target=waiter_module.run, args=(tmp_path / "db", "tok-2", "thread-2", stop), daemon=True)
+    thread.start()
+    try:
+        wait_for(lambda: store.pending(receiver["id"]) is None)
+        assert codex.texts("thread-2") == [f"{message_id} room plan\nhello"]
+        assert codex.requests().count("thread/queue/add") == 1
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+        store.close()
+
+
+def test_the_delivery_refuses_a_message_whose_recipient_is_owned_elsewhere(tmp_path, monkeypatch):
+    codex = FakeCodex(tmp_path / "bin").apply(monkeypatch)
+    store, receiver, message_id = _store_with_message(tmp_path / "db")
+    message = store.pending_for_token("tok")
+    store.activate(receiver["id"], "tok-2")
+    sink = CodexSink(timeout=5)
+    try:
+        with pytest.raises(DeliveryNotOwned):
+            deliver_to_codex(store, sink, "thread-1", message, render_message(message), "tok")
+    finally:
+        sink.close()
+    assert codex.requests().count("thread/queue/add") == 0
+    assert store.pending_for_token("tok-2")["attempted"] == 0
     store.close()
 
 
@@ -190,7 +252,7 @@ def test_a_key_held_by_other_text_is_a_conflict_that_is_reported_once_and_never_
     sink = CodexSink(timeout=5)
     sink.add("thread-1", key, "something else")
     sink.close()
-    store.mark_attempted(message_id)
+    store.mark_attempted(message_id, "tok")
     stop = threading.Event()
     thread = _run_waiter(tmp_path / "db", stop)
     try:
@@ -262,7 +324,7 @@ def test_two_waiters_delivering_the_same_message_add_it_once(tmp_path, monkeypat
         own = Store(tmp_path / "db")
         sink = CodexSink(timeout=10)
         try:
-            return deliver_to_codex(own, sink, "thread-1", message, text)
+            return deliver_to_codex(own, sink, "thread-1", message, text, "tok")
         finally:
             sink.close()
             own.close()
