@@ -5,15 +5,16 @@ answers the four methods the sink uses and keeps its queue, items and request lo
 a JSON file under `directory` so that the test, a second sink, or a restarted waiter
 sees them. Its failures are knobs in that file, changeable while a sink is running:
   consume: "immediate" (default; a queued message becomes an item at once, as on an
-           idle thread) or "never" (it stays queued)
+           idle thread), "never" (it stays queued), or "in_transit" (it leaves the
+           queue and is in the items only once the test calls arrive(): the gap the
+           real app-server has between the two)
   drop_add_response: thread/queue/add is applied but never answered
   hold_add_seconds: thread/queue/add is applied, then answered after this delay
   add_error: thread/queue/add answers this error message
   hang: no request is answered
   unsupported: the queue methods answer "requires experimentalApi capability"
   child: a shell command to leave running as a child, for cleanup tests
-It is not the app-server: the move from queue to items is one step here, where the
-real one has a gap between them.
+It is not the app-server; the gap between queue and items is a state here, not a race.
 """
 
 import fcntl
@@ -41,7 +42,12 @@ def save(path: Path, state: dict) -> None:
 
 
 def thread_state(state: dict, thread_id: str) -> dict:
-    return state["threads"].setdefault(thread_id, {"queue": [], "items": []})
+    return state["threads"].setdefault(thread_id, {"queue": [], "items": [], "transit": []})
+
+
+def as_item(submission: dict) -> dict:
+    return {"type": "userMessage", "id": submission["id"], "clientId": submission["clientUserMessageId"],
+            "content": submission["input"]}
 
 
 def answer(message: dict, result=None, error=None) -> None:
@@ -92,12 +98,13 @@ def main() -> None:
                 continue
             submission = {"id": str(uuid.uuid4()), "clientUserMessageId": params["clientUserMessageId"],
                           "input": params["input"]}
-            if knobs.get("consume", "immediate") == "never":
+            consume = knobs.get("consume", "immediate")
+            if consume == "never":
                 thread["queue"].append(submission)
+            elif consume == "in_transit":
+                thread.setdefault("transit", []).append(submission)
             else:
-                thread["items"].append({"type": "userMessage", "id": submission["id"],
-                                        "clientId": submission["clientUserMessageId"],
-                                        "content": submission["input"]})
+                thread["items"].append(as_item(submission))
             save(path, state)
             if knobs.get("drop_add_response"):
                 time.sleep(3600)
@@ -143,11 +150,22 @@ class FakeCodex:
     def state(self) -> dict:
         return load(self.path)
 
+    def arrive(self, thread_id: str) -> None:
+        """What was in transit on the thread becomes visible in its items."""
+        state = load(self.path)
+        thread = thread_state(state, thread_id)
+        thread["items"].extend(as_item(submission) for submission in thread.get("transit", []))
+        thread["transit"] = []
+        save(self.path, state)
+
     def requests(self) -> list[str]:
         return self.state()["requests"]
 
     def queue(self, thread_id: str) -> list[dict]:
         return self.state()["threads"].get(thread_id, {"queue": []})["queue"]
+
+    def transit(self, thread_id: str) -> list[dict]:
+        return self.state()["threads"].get(thread_id, {"transit": []}).get("transit", [])
 
     def items(self, thread_id: str) -> list[dict]:
         return self.state()["threads"].get(thread_id, {"items": []})["items"]

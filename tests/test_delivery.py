@@ -337,6 +337,9 @@ def test_waiter_retries_refused_codex_queue_add_without_ack(tmp_path):
     )
     assert run["ended_at"] is None
     assert codex.texts("thread-42") == []
+    codex.set(add_error=None)                                  # the refusal was answered: it may add
+    wait_for(lambda: store.pending(receiver["id"]) is None, timeout=10)
+    assert len(codex.texts("thread-42")) == 1
     _stop_waiter(process, store, token)
     store.close()
 

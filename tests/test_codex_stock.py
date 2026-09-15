@@ -65,7 +65,7 @@ def test_a_waiter_that_dies_before_its_ack_is_followed_by_one_that_finds_the_mes
 def test_two_waiters_retrying_at_once_add_the_message_once(outcomes):
     outcome = outcomes["concurrent_retry"]
     _delivered_once(outcome)
-    assert outcome["results"] in (["added", "consumed"], ["added", "queued"]), outcome["results"]
+    assert outcome["results"] in (["added", "consumed"], ["added", "queued"], ["added", "uncertain"]), outcome["results"]
 
 
 def test_a_key_held_by_other_text_is_a_conflict_and_the_message_never_reaches_the_model(outcomes):

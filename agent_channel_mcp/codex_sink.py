@@ -8,11 +8,11 @@ clientUserMessageId into the item it becomes. A delivery is therefore keyed
 (agent-channel:<channel_id>:<message_id>) and, before it is added, the queue and the
 items are read for that key: found with the same text, it was delivered; found with
 other text, the key was reused and that is a conflict; found nowhere, it is added.
-The app-server does not do this for us: the gap between a queued message leaving
-the queue and its item becoming visible is real, and a read that falls into it can
-miss a delivery; the caller narrows it by waiting before it looks again after an
-answer was lost. The API is experimental and may be absent: that is reported, not
-worked around.
+The app-server does not do this for us: it deletes a queued message when its turn
+starts and records the item only later, so a read can find a delivered message in
+neither place. The caller therefore never adds a message it handed over once; found
+nowhere, the message is uncertain and is looked for again. The API is experimental
+and may be absent: that is reported, not worked around.
 
 The app-server is a stock `codex app-server --listen stdio://` child of the waiter.
 It shares the queue database under CODEX_HOME with whatever process hosts the

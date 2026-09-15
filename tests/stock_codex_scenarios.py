@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agent_channel_mcp import waiter as waiter_module          # noqa: E402
 from agent_channel_mcp.codex_sink import CodexSink, KeyConflict  # noqa: E402
 from agent_channel_mcp.store import Store                       # noqa: E402
-from agent_channel_mcp.waiter import WaiterSignal, deliver_to_codex, render_message  # noqa: E402
+from agent_channel_mcp.waiter import DeliveryUncertain, WaiterSignal, deliver_to_codex, render_message  # noqa: E402
 
 requests_seen: list[dict] = []
 
@@ -258,8 +258,8 @@ def waiter_dies_before_the_ack(scenario: Scenario) -> dict:
 
 
 def concurrent_retry(scenario: Scenario) -> dict:
-    """Two waiters (a takeover) retry the same marked message at once."""
-    scenario.store.mark_attempted(scenario.message_id)
+    """Two waiters (an old one and its takeover) deliver the same message at once, each
+    having read it unmarked."""
     message = scenario.store.pending_for_token("tok")
 
     def deliver(_):
@@ -267,6 +267,8 @@ def concurrent_retry(scenario: Scenario) -> dict:
         sink = CodexSink(timeout=60)
         try:
             return deliver_to_codex(own, sink, scenario.thread_id, message, scenario.text)
+        except DeliveryUncertain:
+            return "uncertain"
         finally:
             sink.close()
             own.close()

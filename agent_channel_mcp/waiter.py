@@ -23,6 +23,12 @@ from .store import Store, is_busy
 CODEX_QUEUE_TIMEOUT_SECONDS = 60
 CODEX_RETRY_PAUSE_SECONDS = 5
 CODEX_UNSUPPORTED_PAUSE_SECONDS = 30
+# A message handed over once and not found at the thread is looked for again this often.
+CODEX_UNCERTAIN_PAUSE_SECONDS = 10
+
+
+class DeliveryUncertain(Exception):
+    """The message was handed over once, and is in neither the queue nor the items."""
 
 
 class WaiterSignal(Exception):
@@ -91,24 +97,32 @@ def delivery_lock(db: Path, thread_id: str):
 
 
 def deliver_to_codex(store: Store, sink: CodexSink, thread_id: str, message: dict, text: str) -> str:
-    """Put one message on its thread once: "added", or "queued"/"consumed" when a
-    delivery under its key is already there. Raises KeyConflict, SinkUnsupported,
-    SinkTransportError or SinkError, each leaving the message unacknowledged.
+    """Put one message on its thread at most once: "added", or "queued"/"consumed"
+    when a delivery under its key is already there. Raises KeyConflict, DeliveryUncertain,
+    SinkUnsupported, SinkTransportError or SinkError, each leaving the message
+    unacknowledged.
 
-    The message is marked attempted, durably, before it is handed over: a crash or a
-    lost answer after that leaves the mark, and the next attempt reads the receiver's
-    queue and items for the key before it adds. A message never marked cannot be at
-    the receiver, and is added without the read."""
+    The message is marked attempted, durably, before it is handed over, and a marked
+    message is never added again: the thread's queue and items are read for its key,
+    and a message in neither is uncertain, since the app-server deletes a queued
+    message when its turn starts and records the item only later. The mark is cleared
+    when the app-server answers that it did not take the message; a hand-over with no
+    answer keeps it."""
     key = f"agent-channel:{store.channel_id}:{message['id']}"
     handle = delivery_lock(store.path, thread_id)
     try:
-        if message["attempted"]:
+        # Read under the lock: another waiter may have marked and added it meanwhile.
+        if store.attempted(message["id"]):
             found = sink.find(thread_id, key, text)
-            if found is not None:
-                return found
-        else:
-            store.mark_attempted(message["id"])
-        sink.add(thread_id, key, text)
+            if found is None:
+                raise DeliveryUncertain(f"delivery uncertain for message {message['id']}; not re-adding")
+            return found
+        store.mark_attempted(message["id"])
+        try:
+            sink.add(thread_id, key, text)
+        except SinkError:                        # answered: the message was not taken
+            store.clear_attempted(message["id"])
+            raise
         return "added"
     finally:
         handle.close()
@@ -129,6 +143,7 @@ def run(db: Path, token: str, codex_thread: str | None = None,
             reported_error = None
             sink: CodexSink | None = None
             conflicted: set[int] = set()
+            uncertain: dict[int, float] = {}          # message id -> when to look again
             try:
                 if codex_thread is not None:
                     if not codex_thread.strip():
@@ -144,7 +159,10 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                         if time.monotonic() >= next_heartbeat:
                             store.waiter_heartbeat(token)
                             next_heartbeat = time.monotonic() + 5
-                        message = store.pending_for_token(token, excluding=conflicted)
+                        # An uncertain message is looked for again when its time comes;
+                        # until then the ones after it are served.
+                        waiting = {id for id, at in uncertain.items() if at > time.monotonic()}
+                        message = store.pending_for_token(token, excluding=conflicted | waiting)
                         if message is None:
                             stop.wait(0.5)
                             continue
@@ -160,9 +178,19 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                                 # Permanent: the key is taken by other text. Not acknowledged,
                                 # not added, not tried again; said once and left to a person.
                                 conflicted.add(message["id"])
+                                uncertain.pop(message["id"], None)
                                 detail = f"key conflict for message {message['id']}: {conflict}"
                                 store.waiter_error(token, detail)
                                 print(detail, file=sys.stderr, flush=True)
+                                continue
+                            except DeliveryUncertain as why:
+                                # Handed over once, found nowhere: not added again, not
+                                # acknowledged; looked for again later, said once.
+                                first = message["id"] not in uncertain
+                                uncertain[message["id"]] = time.monotonic() + CODEX_UNCERTAIN_PAUSE_SECONDS
+                                store.waiter_error(token, str(why))
+                                if first:
+                                    print(why, file=sys.stderr, flush=True)
                                 continue
                             except SinkUnsupported as unsupported:
                                 # No safe way to deliver: nothing is sent, and why is on record.
@@ -195,6 +223,7 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                                 stop.wait(CODEX_RETRY_PAUSE_SECONDS)
                                 continue
                         store.ack_for_token(token, message["id"])
+                        uncertain.pop(message["id"], None)
                         reported_error = None
                     except sqlite3.OperationalError as error:
                         # Another process holds the database. Keep serving; a message
