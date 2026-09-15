@@ -1,5 +1,5 @@
 """Attacks on the boundaries: a takeover between a session's check and its write,
-a constructor or a close that the database refuses, a queue that hangs with a
+a constructor or a close that the database refuses, an app-server that hangs with a
 child, two registers at once, a commit that fails."""
 
 import os
@@ -16,6 +16,7 @@ import pytest
 from agent_channel_mcp import waiter as waiter_module
 from agent_channel_mcp.server import Channel
 from agent_channel_mcp.store import Store
+from fake_app_server import FakeCodex
 
 
 def wait_for(predicate, timeout: float = 6.0):
@@ -184,12 +185,6 @@ def test_a_close_the_database_refuses_still_stops_the_threads_and_closes(tmp_pat
 
 # A close over a waiter the server runs itself.
 
-def _codex_that_sleeps(bin_dir: Path, marker: str) -> None:
-    codex = bin_dir / "codex"
-    codex.write_text(f"#!/bin/sh\n{marker} &\nwait\n", encoding="utf-8")
-    codex.chmod(0o755)
-
-
 def _marker() -> str:
     return f"sleep {20 + os.getpid() % 7}.{os.getpid() % 100:02d}"
 
@@ -199,11 +194,7 @@ def _still_running(marker: str) -> bool:
 
 
 def test_a_close_whose_sign_off_is_refused_still_stops_the_managed_waiter(tmp_path, monkeypatch):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    (bin_dir / "codex").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    (bin_dir / "codex").chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    FakeCodex(tmp_path / "bin").apply(monkeypatch)
     db = tmp_path / "db"
     channel = Channel(db)
     joined = channel.join("room", "exec", "codex")
@@ -226,12 +217,9 @@ def test_a_close_whose_sign_off_is_refused_still_stops_the_managed_waiter(tmp_pa
     assert Store(db).token_active(token)                 # the refused sign-off is not hidden
 
 
-def test_a_close_during_a_queue_takes_the_queue_and_its_child_with_it(tmp_path, monkeypatch):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
+def test_a_close_during_a_queue_takes_the_app_server_and_its_child_with_it(tmp_path, monkeypatch):
     marker = _marker()
-    _codex_that_sleeps(bin_dir, marker)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    FakeCodex(tmp_path / "bin", hang=True, child=marker).apply(monkeypatch)
     db = tmp_path / "db"
     channel = Channel(db)
     sender = channel.store.participant("room", "plan")
@@ -250,12 +238,9 @@ def test_a_close_during_a_queue_takes_the_queue_and_its_child_with_it(tmp_path, 
     checker.close()
 
 
-def test_a_waiter_signalled_during_a_queue_takes_the_queue_and_its_child_with_it(tmp_path, monkeypatch):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
+def test_a_waiter_signalled_during_a_queue_takes_the_app_server_and_its_child_with_it(tmp_path, monkeypatch):
     marker = _marker()
-    _codex_that_sleeps(bin_dir, marker)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    codex = FakeCodex(tmp_path / "bin", hang=True, child=marker)
     db = tmp_path / "db"
     store = Store(db)
     sender = store.participant("room", "plan")
@@ -265,7 +250,7 @@ def test_a_waiter_signalled_during_a_queue_takes_the_queue_and_its_child_with_it
     process = subprocess.Popen(
         [sys.executable, "-m", "agent_channel_mcp.waiter", "--db", str(db), "--token", "tok",
          "--codex", "thread-1"],
-        env=os.environ.copy(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=codex.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     try:
         wait_for(lambda: _still_running(marker), timeout=8)
@@ -285,11 +270,7 @@ def test_a_supervisor_delayed_before_starting_a_worker_starts_none_after_close(t
     """The supervisor has decided to start a waiter and stalls just before doing so;
     close runs meanwhile and the sign-off is refused. The stalled start must be refused
     too, or a waiter no stop reaches would outlive the close."""
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    (bin_dir / "codex").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    (bin_dir / "codex").chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    FakeCodex(tmp_path / "bin").apply(monkeypatch)
     db = tmp_path / "db"
     channel = Channel(db)
     channel.join("room", "exec", "codex")
@@ -323,42 +304,22 @@ def test_a_supervisor_delayed_before_starting_a_worker_starts_none_after_close(t
     checker.close()
 
 
-# What a restarted waiter queues again, and what it cannot help queueing again.
+# What a restarted waiter queues again, and what it finds already there.
 
-def _logging_codex(bin_dir: Path, after: str = "") -> None:
-    codex = bin_dir / "codex"
-    codex.write_text(
-        "#!/bin/sh\n"
-        "printf '%s\\0' \"$@\" >> \"$CODEX_ARGS_LOG\"\n"
-        f"{after}\n"
-        "exit 0\n",
-        encoding="utf-8",
-    )
-    codex.chmod(0o755)
+def _queued(codex: FakeCodex) -> list[str]:
+    return [text.split("\n")[0] for text in codex.texts("thread-1")]
 
 
-def _queued(log: Path) -> list[str]:
-    if not log.exists():
-        return []
-    args = log.read_bytes().split(b"\0")[:-1]
-    return [args[i + 1].decode().split("\n")[0] for i, arg in enumerate(args) if arg == b"--message"]
-
-
-def _waiter(db: Path, token: str) -> subprocess.Popen:
+def _waiter(db: Path, token: str, codex: FakeCodex) -> subprocess.Popen:
     return subprocess.Popen(
         [sys.executable, "-m", "agent_channel_mcp.waiter", "--db", str(db), "--token", token,
          "--codex", "thread-1"],
-        env=os.environ.copy(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        env=codex.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
     )
 
 
-def test_a_restarted_waiter_queues_only_what_was_never_acknowledged(tmp_path, monkeypatch):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    log = tmp_path / "sink.log"
-    _logging_codex(bin_dir)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("CODEX_ARGS_LOG", str(log))
+def test_a_restarted_waiter_queues_only_what_was_never_acknowledged(tmp_path):
+    codex = FakeCodex(tmp_path / "bin")
     db = tmp_path / "db"
     store = Store(db)
     sender = store.participant("room", "plan")
@@ -366,65 +327,57 @@ def test_a_restarted_waiter_queues_only_what_was_never_acknowledged(tmp_path, mo
     store.activate(receiver["id"], "first-session")
     first = store.send(sender["id"], "one", to="exec")[0]["message_id"]
     second = store.send(sender["id"], "two", to="exec")[0]["message_id"]
-    waiter = _waiter(db, "first-session")
+    waiter = _waiter(db, "first-session", codex)
     wait_for(lambda: store.pending(receiver["id"]) is None, timeout=10)
     store.deactivate("first-session")                       # the session ends; the waiter follows
     assert waiter.wait(timeout=10) == 0
     third = store.send(sender["id"], "three", to="exec")[0]["message_id"]
     store.activate(receiver["id"], "second-session")        # the same role, a new connection
-    waiter = _waiter(db, "second-session")
+    waiter = _waiter(db, "second-session", codex)
     try:
         wait_for(lambda: store.pending(receiver["id"]) is None, timeout=10)
         time.sleep(1.0)                                     # long enough to queue again if it would
-        assert _queued(log) == [f"{first} room plan", f"{second} room plan", f"{third} room plan"]
+        assert _queued(codex) == [f"{first} room plan", f"{second} room plan", f"{third} room plan"]
     finally:
         store.deactivate("second-session")
         waiter.wait(timeout=10)
         store.close()
 
 
-def test_a_waiter_that_dies_after_the_queue_took_the_message_queues_it_again(tmp_path, monkeypatch):
-    """The limit of at-least-once: accepted by the sink, not yet acknowledged, so the
-    next waiter queues the same id once more. A sink that cannot take an id twice
-    would need to say so itself."""
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    log = tmp_path / "sink.log"
-    _logging_codex(bin_dir, after="kill -9 $PPID")           # the waiter dies right after acceptance
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("CODEX_ARGS_LOG", str(log))
+def test_a_waiter_that_dies_after_the_queue_took_the_message_finds_it_there(tmp_path):
+    """Accepted by the app-server, not yet acknowledged: the next waiter reads the
+    thread for the message's key, finds it consumed, and acknowledges without
+    queueing it again."""
+    codex = FakeCodex(tmp_path / "bin", hold_add_seconds=30)  # accepted, answer withheld
     db = tmp_path / "db"
     store = Store(db)
     sender = store.participant("room", "plan")
     receiver = store.participant("room", "exec")
     store.activate(receiver["id"], "tok")
-    only = store.send(sender["id"], "once, twice", to="exec")[0]["message_id"]
-    waiter = _waiter(db, "tok")
+    only = store.send(sender["id"], "once, not twice", to="exec")[0]["message_id"]
+    waiter = _waiter(db, "tok", codex)
+    wait_for(lambda: _queued(codex) == [f"{only} room plan"], timeout=10)
+    waiter.kill()                                             # dies while the answer is withheld
     assert waiter.wait(timeout=10) == -9
-    assert _queued(log) == [f"{only} room plan"]
     assert store.pending(receiver["id"])["id"] == only        # accepted, never acknowledged
-    _logging_codex(bin_dir)                                   # the sink behaves from now on
-    waiter = _waiter(db, "tok")
+    codex.set(hold_add_seconds=None)
+    waiter = _waiter(db, "tok", codex)
     try:
         wait_for(lambda: store.pending(receiver["id"]) is None, timeout=10)
-        assert _queued(log) == [f"{only} room plan", f"{only} room plan"]
+        assert _queued(codex) == [f"{only} room plan"]
+        assert "thread/items/list" in codex.requests()        # found, not added
     finally:
         store.deactivate("tok")
         waiter.wait(timeout=10)
         store.close()
 
 
-# A queue that hangs with a child of its own.
+# An app-server that hangs with a child of its own.
 
-def test_a_timed_out_queue_takes_its_children_with_it(tmp_path, monkeypatch):
+def test_a_timed_out_app_server_takes_its_children_with_it(tmp_path, monkeypatch):
     monkeypatch.setattr(waiter_module, "CODEX_QUEUE_TIMEOUT_SECONDS", 0.5)
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    marker = f"sleep {20 + os.getpid() % 7}.{os.getpid() % 100:02d}"
-    codex = bin_dir / "codex"
-    codex.write_text(f"#!/bin/sh\n{marker} &\nwait\n", encoding="utf-8")
-    codex.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    marker = _marker()
+    FakeCodex(tmp_path / "bin", hang=True, child=marker).apply(monkeypatch)
     db = tmp_path / "db"
     store = Store(db)
     sender = store.participant("room", "plan")
@@ -437,7 +390,7 @@ def test_a_timed_out_queue_takes_its_children_with_it(tmp_path, monkeypatch):
         run = wait_for(lambda: (
             (run := store.last_waiter(receiver["id"], "tok")) and run["last_error"] and run
         ), timeout=8)
-        assert "timed out" in run["last_error"]
+        assert "did not answer within 0.5 s" in run["last_error"]
         time.sleep(0.3)
         left = subprocess.run(["pgrep", "-f", f"^{marker}$"], capture_output=True, text=True)
         assert left.stdout.strip() == "", left.stdout
@@ -451,11 +404,7 @@ def test_a_timed_out_queue_takes_its_children_with_it(tmp_path, monkeypatch):
 # Two registers at once, and a commit that fails.
 
 def test_two_registers_at_once_end_with_one_waiter_and_both_satisfied(tmp_path, monkeypatch):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    (bin_dir / "codex").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    (bin_dir / "codex").chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    FakeCodex(tmp_path / "bin").apply(monkeypatch)
     db = tmp_path / "db"
     channel = Channel(db)
     joined = channel.join("room", "exec", "codex")

@@ -16,6 +16,7 @@ from agent_channel_mcp import server as server_module, waiter as waiter_module
 from agent_channel_mcp.server import Channel
 from agent_channel_mcp.store import Store
 from agent_channel_mcp.waiter import lock_path
+from fake_app_server import FakeCodex
 
 
 def wait_for(predicate, timeout: float = 6.0):
@@ -43,19 +44,6 @@ def _hold_write_lock(db: Path, seconds: float) -> subprocess.Popen:
     )
     assert process.stdout.readline().strip() == "held"
     return process
-
-
-def _codex_stub(directory: Path, *, exit_code: int = 0, sleep: float = 0) -> Path:
-    executable = directory / "codex"
-    executable.write_text(
-        "#!/bin/sh\n"
-        f"sleep {sleep}\n"
-        "printf '%s\\0' \"$@\" >> \"$CODEX_ARGS_LOG\"\n"
-        f"exit {exit_code}\n",
-        encoding="utf-8",
-    )
-    executable.chmod(0o755)
-    return executable
 
 
 def _heartbeat_of(db: Path, token: str) -> int:
@@ -123,11 +111,7 @@ def test_the_heartbeat_thread_ends_on_a_permanent_error_and_join_reports_it(
 def test_the_supervisor_waits_out_a_lock_and_then_starts_the_requested_waiter(
     tmp_path, monkeypatch
 ):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    _codex_stub(bin_dir)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("CODEX_ARGS_LOG", str(tmp_path / "codex-args.log"))
+    FakeCodex(tmp_path / "bin").apply(monkeypatch)
     db = tmp_path / "db"
     channel = Channel(db)
     channel.join("room", "exec", "claude")
@@ -158,11 +142,7 @@ def _register(db: Path, token: str) -> subprocess.CompletedProcess:
 
 
 def test_a_start_that_fails_for_a_while_is_tried_again_until_it_runs(tmp_path, monkeypatch):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    _codex_stub(bin_dir)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("CODEX_ARGS_LOG", str(tmp_path / "codex-args.log"))
+    FakeCodex(tmp_path / "bin").apply(monkeypatch)
     db = tmp_path / "db"
     channel = Channel(db)
     channel.join("room", "exec", "codex")
@@ -185,11 +165,7 @@ def test_a_start_that_keeps_failing_is_reported_to_register_before_it_gives_up(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(server_module, "WAITER_START_WINDOW_SECONDS", 3)
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    _codex_stub(bin_dir)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("CODEX_ARGS_LOG", str(tmp_path / "codex-args.log"))
+    FakeCodex(tmp_path / "bin").apply(monkeypatch)
     db = tmp_path / "db"
     channel = Channel(db)
     joined = channel.join("room", "exec", "codex")
@@ -287,16 +263,12 @@ def test_the_waiter_waits_out_a_busy_database_and_delivers_after(tmp_path):
         channel.close()
 
 
-def test_a_hung_codex_queue_is_cut_off_and_the_same_message_is_delivered_later(
+def test_a_hung_app_server_is_cut_off_and_the_same_message_is_delivered_later(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(waiter_module, "CODEX_QUEUE_TIMEOUT_SECONDS", 0.5)
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    log = tmp_path / "codex-args.log"
-    _codex_stub(bin_dir, sleep=5)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("CODEX_ARGS_LOG", str(log))
+    monkeypatch.setattr(waiter_module, "CODEX_RETRY_PAUSE_SECONDS", 0.5)
+    codex = FakeCodex(tmp_path / "bin", hang=True).apply(monkeypatch)
     db = tmp_path / "db"
     store = Store(db)
     sender = store.participant("room", "plan")
@@ -310,13 +282,12 @@ def test_a_hung_codex_queue_is_cut_off_and_the_same_message_is_delivered_later(
         run = wait_for(lambda: (
             (run := store.last_waiter(receiver["id"], token)) and run["last_error"] and run
         ), timeout=8)
-        assert "timed out after 0.5 s" in run["last_error"]
+        assert "did not answer within 0.5 s" in run["last_error"]
         assert store.pending(receiver["id"])["id"] == message_id      # not acknowledged
-        assert not log.exists()                                       # nothing got through
-        _codex_stub(bin_dir)                                          # codex answers again
+        assert codex.texts("thread-1") == []                          # nothing got through
+        codex.set(hang=None)                                          # the app-server answers again
         wait_for(lambda: store.pending(receiver["id"]) is None, timeout=12)
-        args = log.read_bytes().split(b"\0")[:-1]
-        assert args[args.index(b"--message") + 1] == f"{message_id} room plan\nslow lane".encode()
+        assert codex.texts("thread-1") == [f"{message_id} room plan\nslow lane"]
     finally:
         store.deactivate(token)
         thread.join(timeout=5)
@@ -382,11 +353,7 @@ def test_finishing_a_request_leaves_a_newer_one_made_in_the_same_second(tmp_path
 
 
 def test_an_earlier_run_in_the_same_second_is_not_taken_for_this_attempt(tmp_path, monkeypatch):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    _codex_stub(bin_dir)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("CODEX_ARGS_LOG", str(tmp_path / "codex-args.log"))
+    FakeCodex(tmp_path / "bin").apply(monkeypatch)
     db = tmp_path / "db"
     channel = Channel(db)
     joined = channel.join("room", "exec", "claude")

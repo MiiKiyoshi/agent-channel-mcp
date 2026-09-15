@@ -15,6 +15,7 @@ import pytest
 from agent_channel_mcp.store import PRESENCE_LEASE_SECONDS, Store
 from agent_channel_mcp.server import Channel
 from agent_channel_mcp.waiter import render_message
+from fake_app_server import FakeCodex
 
 
 def wait_for(predicate, timeout: float = 4.0):
@@ -269,18 +270,6 @@ def _stop_waiter(process: subprocess.Popen, store: Store, token: str):
         process.stderr.close()
 
 
-def _codex_stub(directory: Path, exit_code: int = 0) -> Path:
-    executable = directory / "codex"
-    executable.write_text(
-        "#!/bin/sh\n"
-        f"printf '%s\\0' \"$@\" >> \"$CODEX_ARGS_LOG\"\n"
-        f"exit {exit_code}\n",
-        encoding="utf-8",
-    )
-    executable.chmod(0o755)
-    return executable
-
-
 def test_waiter_delivers_text_and_acks_after_stdout_success(tmp_path):
     db = tmp_path / "channel.sqlite3"
     store = Store(db)
@@ -328,41 +317,33 @@ def test_waiter_preserves_pending_when_stdout_is_unwritable(tmp_path):
     store.close()
 
 
-def test_waiter_retries_failed_codex_queue_without_ack(tmp_path):
+def test_waiter_retries_refused_codex_queue_add_without_ack(tmp_path):
     db = tmp_path / "channel.sqlite3"
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    log = tmp_path / "codex-args.log"
-    _codex_stub(bin_dir, exit_code=7)
+    codex = FakeCodex(tmp_path / "bin", add_error="thread not found")
     store = Store(db)
     sender = store.participant("room", "sender")
     receiver = store.participant("room", "receiver")
     send_one(store, sender["id"], receiver["name"], "hello")
     token = "session-token"
     _active(store, receiver, token)
-    environment = os.environ.copy()
-    environment["PATH"] = f"{bin_dir}{os.pathsep}{environment['PATH']}"
-    environment["CODEX_ARGS_LOG"] = str(log)
-    process = subprocess.Popen(_waiter_command(db, token) + ["--codex", "thread-42"], env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    wait_for(lambda: log.exists() and len(log.read_text(encoding="utf-8").splitlines()) > 0)
+    process = subprocess.Popen(_waiter_command(db, token) + ["--codex", "thread-42"], env=codex.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    wait_for(lambda: "thread/queue/add" in codex.requests())
     time.sleep(0.1)
     assert store.pending(receiver["id"]) is not None
     run = wait_for(lambda: store.last_waiter(receiver["id"], token))
     wait_for(lambda: store.last_waiter(receiver["id"], token)["last_error"])
     assert store.last_waiter(receiver["id"], token)["last_error"] == (
-        f"codex queue exited 7 for message {store.pending(receiver['id'])['id']}"
+        f"codex app-server thread not found for message {store.pending(receiver['id'])['id']}"
     )
     assert run["ended_at"] is None
+    assert codex.texts("thread-42") == []
     _stop_waiter(process, store, token)
     store.close()
 
 
-def test_waiter_codex_queue_acks_and_preserves_message_argument(tmp_path):
+def test_waiter_codex_queue_acks_and_preserves_message_text(tmp_path):
     db = tmp_path / "channel.sqlite3"
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    log = tmp_path / "codex-args.log"
-    _codex_stub(bin_dir)
+    codex = FakeCodex(tmp_path / "bin")
     store = Store(db)
     sender = store.participant("room", "sender")
     receiver = store.participant("room", "receiver")
@@ -370,19 +351,15 @@ def test_waiter_codex_queue_acks_and_preserves_message_argument(tmp_path):
     message_id = send_one(store, sender["id"], receiver["name"], text)
     token = "session-token"
     _active(store, receiver, token)
-    environment = os.environ.copy()
-    environment["PATH"] = f"{bin_dir}{os.pathsep}{environment['PATH']}"
-    environment["CODEX_ARGS_LOG"] = str(log)
     process = subprocess.Popen(
         _waiter_command(db, token) + ["--codex", "thread-42"],
-        env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=codex.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     try:
         wait_for(lambda: store.pending(receiver["id"]) is None)
-        args = log.read_bytes().split(b"\0")[:-1]
-        assert b"thread-42" in args
-        delivered = args[args.index(b"--message") + 1].decode()
-        assert delivered == f"{message_id} room sender\n{text}"
+        assert codex.texts("thread-42") == [f"{message_id} room sender\n{text}"]
+        [item] = codex.items("thread-42")
+        assert item["clientId"] == f"agent-channel:{store.channel_id}:{message_id}"
         assert not (tmp_path / "pwned").exists()
         assert message_id > 0
     finally:
@@ -546,12 +523,7 @@ def test_mcp_managed_codex_waiter_outlives_launcher_and_delivers(
     tmp_path, monkeypatch
 ):
     db = tmp_path / "channel.sqlite3"
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    log = tmp_path / "codex-args.log"
-    _codex_stub(bin_dir)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("CODEX_ARGS_LOG", str(log))
+    codex = FakeCodex(tmp_path / "bin").apply(monkeypatch)
     channel = Channel(db)
     sender = channel.store.participant("room", "sender")
     joined = channel.join("room", "receiver", "codex")
@@ -575,10 +547,7 @@ def test_mcp_managed_codex_waiter_outlives_launcher_and_delivers(
             channel.store, sender["id"], receiver["name"], "managed"
         )
         wait_for(lambda: channel.store.pending(receiver["id"]) is None)
-        args = log.read_bytes().split(b"\0")[:-1]
-        assert args[args.index(b"--message") + 1] == (
-            f"{message_id} room sender\nmanaged".encode()
-        )
+        assert codex.texts("thread-42") == [f"{message_id} room sender\nmanaged"]
     finally:
         channel.store.deactivate(token)
         wait_for(

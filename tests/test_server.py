@@ -13,6 +13,7 @@ import pytest
 
 from agent_channel_mcp.server import Channel, create_server
 from agent_channel_mcp.store import PRESENCE_LEASE_SECONDS, Store
+from fake_app_server import FakeCodex
 
 
 def test_identity_takeover_invalidates_old_session(tmp_path):
@@ -266,18 +267,8 @@ def unpack(result):
 
 def test_two_stdio_clients_and_generated_waiter(tmp_path):
     async def scenario():
-        bin_dir = tmp_path / "bin"
-        bin_dir.mkdir()
-        codex_log = tmp_path / "codex-args.log"
-        codex = bin_dir / "codex"
-        codex.write_text(
-            "#!/bin/sh\nprintf '%s\\0' \"$@\" >> \"$CODEX_ARGS_LOG\"\n",
-            encoding="utf-8",
-        )
-        codex.chmod(0o755)
-        environment = dict(os.environ)
-        environment["PATH"] = f"{bin_dir}{os.pathsep}{environment['PATH']}"
-        environment["CODEX_ARGS_LOG"] = str(codex_log)
+        codex = FakeCodex(tmp_path / "bin")
+        environment = codex.env
         params = StdioServerParameters(
             command=str(Path(sys.executable).with_name("agent-channel-mcp")),
             args=["--db", str(tmp_path / "db")],
@@ -300,7 +291,7 @@ def test_two_stdio_clients_and_generated_waiter(tmp_path):
                 ]
                 waiting = joined
                 assert waiting["waiter"] == "offline"
-                assert "codex queue" in waiting["how"]
+                assert "queued user message" in waiting["how"]
                 assert 'sandbox_permissions="require_escalated"' in waiting["how"]
                 command = shlex.split(waiting["command"])
                 command[-1] = "thread-42"
@@ -324,15 +315,12 @@ def test_two_stdio_clients_and_generated_waiter(tmp_path):
                             "quotes ' \" $(touch SHOULD_NOT_EXIST) `echo test`\n"
                             + "x" * 500 + "\nx")
                 for _ in range(100):
-                    if codex_log.exists():
-                        args = codex_log.read_bytes().split(b"\0")[:-1]
-                        if b"--message" in args:
-                            delivered = args[args.index(b"--message") + 1].decode()
-                            break
+                    if codex.texts("thread-42"):
+                        break
                     await asyncio.sleep(0.05)
                 else:
-                    pytest.fail("managed waiter did not call codex queue")
-                assert delivered == expected
+                    pytest.fail("managed waiter did not queue the message")
+                assert codex.texts("thread-42") == [expected]
                 assert not (tmp_path / "SHOULD_NOT_EXIST").exists()
                 reply = unpack(await b.call_tool("send", {"to": "claude", "text": "Reviewed"}))
                 assert reply["deliveries"][0]["message_id"] > message_id
@@ -346,9 +334,9 @@ def test_two_stdio_clients_and_generated_waiter(tmp_path):
                 sent = unpack(await a.call_tool(
                     "send", {"to": "codex", "text": "room two", "room": "second"}
                 ))
-                expected = f"{sent['deliveries'][0]['message_id']} second claude\nroom two".encode()
+                expected = f"{sent['deliveries'][0]['message_id']} second claude\nroom two"
                 for _ in range(100):
-                    if expected in codex_log.read_bytes().split(b"\0"):
+                    if expected in codex.texts("thread-42"):
                         break
                     await asyncio.sleep(0.05)
                 else:

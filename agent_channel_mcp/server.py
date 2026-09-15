@@ -283,7 +283,7 @@ class Channel:
                    'sandbox_permissions="require_escalated", '
                    'justification="Allow the channel waiter to deliver messages to this Codex thread?"), '
                    'then end the turn. It returns after the MCP-managed waiter is active. '
-                   'Requires codex queue; do not poll.')
+                   'Each message then arrives as a queued user message; do not poll.')
         else:
             how = ("Run command and read stdout. Keep the turn active unless your client "
                    "supports waking on output.")

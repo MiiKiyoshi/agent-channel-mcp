@@ -12,7 +12,8 @@ HEARTBEAT_INTERVAL_SECONDS = 5
 PRESENCE_LEASE_SECONDS = 15
 # Bumped when the tables or columns change; a store at this version skips the setup
 # transaction, so opening a connection takes no write lock.
-SCHEMA_VERSION = 1
+# 2: meta(channel_id) and messages.attempted, for delivery keys a receiver can recognise.
+SCHEMA_VERSION = 2
 # A token names presence files beside the database; it is a file-name component.
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
@@ -139,6 +140,22 @@ class Store:
                 self.db.execute(
                     "ALTER TABLE participants ADD COLUMN connection_heartbeat_at INTEGER"
                 )
+            # A message's delivery to a receiver that keeps what it accepted is keyed by
+            # this store's id and the message's; `attempted` says a delivery of it may
+            # already have reached the receiver, so the next attempt looks before adding.
+            if "attempted" not in {
+                row["name"] for row in self.db.execute("PRAGMA table_info(messages)")
+            }:
+                self.db.execute(
+                    "ALTER TABLE messages ADD COLUMN attempted INTEGER NOT NULL DEFAULT 0"
+                )
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            self.db.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES ('channel_id', ?)",
+                (uuid.uuid4().hex,),
+            )
             self.db.execute(
                 "INSERT OR IGNORE INTO rooms(name, last_activity) "
                 "SELECT DISTINCT room, ? FROM participants", (int(time.time()),)
@@ -455,16 +472,33 @@ class Store:
         ).fetchone()
         return dict(row) if row is not None else None
 
-    def pending_for_token(self, token: str) -> dict | None:
-        """Oldest unacknowledged message across every room this connection holds."""
+    def pending_for_token(self, token: str, excluding: set[int] = frozenset()) -> dict | None:
+        """Oldest unacknowledged message across every room this connection holds,
+        leaving out the ids in `excluding` (ones the waiter has given up on)."""
+        skipped = sorted(excluding)
         row = self.db.execute(
-            "SELECT m.id, s.room, s.name AS sender, r.id AS recipient_id, r.name AS recipient, m.text "
+            "SELECT m.id, s.room, s.name AS sender, r.id AS recipient_id, r.name AS recipient, "
+            "m.text, m.attempted "
             "FROM messages m JOIN participants s ON s.id=m.sender_id "
             "JOIN participants r ON r.id=m.recipient_id "
-            "WHERE r.token=? AND r.left_at IS NULL AND m.acknowledged=0 ORDER BY m.id LIMIT 1",
-            (token,)
+            "WHERE r.token=? AND r.left_at IS NULL AND m.acknowledged=0 "
+            + ("AND m.id NOT IN (" + ",".join("?" * len(skipped)) + ") " if skipped else "")
+            + "ORDER BY m.id LIMIT 1",
+            (token, *skipped),
         ).fetchone()
         return dict(row) if row is not None else None
+
+    @property
+    def channel_id(self) -> str:
+        """This store's own id, part of every delivery key it hands a receiver."""
+        return self.db.execute("SELECT value FROM meta WHERE key='channel_id'").fetchone()["value"]
+
+    def mark_attempted(self, message_id: int) -> None:
+        """Written before a delivery is handed to a receiver, so that a crash or a lost
+        answer after the hand-over leaves the message marked and the next attempt
+        looks for it at the receiver before adding it again."""
+        with self.db:
+            self.db.execute("UPDATE messages SET attempted=1 WHERE id=?", (message_id,))
 
     def ack(self, participant_id: str, message_id: int) -> None:
         with self.db:

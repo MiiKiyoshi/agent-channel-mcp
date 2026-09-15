@@ -3,20 +3,26 @@
 import argparse
 import fcntl
 import os
-import signal
+import re
 import shutil
+import signal
 import sqlite3
 import stat
-import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
+from .codex_sink import (
+    COMMAND as CODEX_COMMAND, CodexSink, KeyConflict, SinkError, SinkTransportError, SinkUnsupported,
+)
 from .store import Store, is_busy
 
-# A codex queue that hangs is killed after this long and the message stays unacknowledged.
+# An app-server call that hangs is cut off after this long; the message stays
+# unacknowledged and is looked for before it is added again.
 CODEX_QUEUE_TIMEOUT_SECONDS = 60
+CODEX_RETRY_PAUSE_SECONDS = 5
+CODEX_UNSUPPORTED_PAUSE_SECONDS = 30
 
 
 class WaiterSignal(Exception):
@@ -74,20 +80,38 @@ def render_message(message: dict) -> str:
     return "\n".join(output)
 
 
-def _await_queue(queue: subprocess.Popen, stop: threading.Event) -> str | None:
-    """How the queue ended: None for delivered, otherwise why not. A stop set while
-    it runs ends the wait; the caller kills what is still running."""
-    deadline = time.monotonic() + CODEX_QUEUE_TIMEOUT_SECONDS
-    while True:
-        try:
-            code = queue.wait(timeout=0.5)
-        except subprocess.TimeoutExpired:
-            if stop.is_set():
-                return "stopped before codex queue returned"
-            if time.monotonic() >= deadline:
-                return f"timed out after {CODEX_QUEUE_TIMEOUT_SECONDS} s"
-            continue
-        return f"exited {code}" if code else None
+def delivery_lock(db: Path, thread_id: str):
+    """The lock every waiter of this database takes around one look-then-add on a
+    receiving thread, so two of them (an old one still running, a new one after a
+    takeover) cannot both find nothing and both add. Released when the handle closes."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", thread_id)[:80]
+    handle = _open_lock_file(db.with_name(f"{db.name}.{safe}.deliver.lock"), os.O_RDWR | os.O_CREAT)
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    return handle
+
+
+def deliver_to_codex(store: Store, sink: CodexSink, thread_id: str, message: dict, text: str) -> str:
+    """Put one message on its thread once: "added", or "queued"/"consumed" when a
+    delivery under its key is already there. Raises KeyConflict, SinkUnsupported,
+    SinkTransportError or SinkError, each leaving the message unacknowledged.
+
+    The message is marked attempted, durably, before it is handed over: a crash or a
+    lost answer after that leaves the mark, and the next attempt reads the receiver's
+    queue and items for the key before it adds. A message never marked cannot be at
+    the receiver, and is added without the read."""
+    key = f"agent-channel:{store.channel_id}:{message['id']}"
+    handle = delivery_lock(store.path, thread_id)
+    try:
+        if message["attempted"]:
+            found = sink.find(thread_id, key, text)
+            if found is not None:
+                return found
+        else:
+            store.mark_attempted(message["id"])
+        sink.add(thread_id, key, text)
+        return "added"
+    finally:
+        handle.close()
 
 
 def run(db: Path, token: str, codex_thread: str | None = None,
@@ -103,12 +127,14 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                 store.waiter_started(participant_id, token, os.getpid())
             next_heartbeat = time.monotonic()
             reported_error = None
+            sink: CodexSink | None = None
+            conflicted: set[int] = set()
             try:
                 if codex_thread is not None:
                     if not codex_thread.strip():
                         raise ValueError("Codex thread ID must not be blank")
-                    if shutil.which("codex") is None:
-                        raise ValueError("codex must be on PATH")
+                    if shutil.which(CODEX_COMMAND[0]) is None:
+                        raise ValueError(f"{CODEX_COMMAND[0]} must be on PATH")
                 while not stop.is_set():
                     try:
                         if not store.token_active(token):
@@ -118,7 +144,7 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                         if time.monotonic() >= next_heartbeat:
                             store.waiter_heartbeat(token)
                             next_heartbeat = time.monotonic() + 5
-                        message = store.pending_for_token(token)
+                        message = store.pending_for_token(token, excluding=conflicted)
                         if message is None:
                             stop.wait(0.5)
                             continue
@@ -126,32 +152,47 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                         if codex_thread is None:
                             print(text, flush=True)
                         else:
-                            # In a session of its own, so that ending it, at the timeout,
-                            # at a stop or at a signal, takes its children too.
-                            queue = subprocess.Popen(
-                                ["codex", "queue", "--thread", codex_thread, "--message", text],
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                start_new_session=True,
-                            )
                             try:
-                                failed = _await_queue(queue, stop)
-                            finally:
-                                if queue.poll() is None:
-                                    os.killpg(queue.pid, signal.SIGKILL)
-                                    queue.wait()
-                            if failed is not None:
-                                # Not acknowledged, so it is tried again.
-                                detail = f"codex queue {failed} for message {message['id']}"
+                                if sink is None:
+                                    sink = CodexSink(timeout=CODEX_QUEUE_TIMEOUT_SECONDS, stop=stop)
+                                deliver_to_codex(store, sink, codex_thread, message, text)
+                            except KeyConflict as conflict:
+                                # Permanent: the key is taken by other text. Not acknowledged,
+                                # not added, not tried again; said once and left to a person.
+                                conflicted.add(message["id"])
+                                detail = f"key conflict for message {message['id']}: {conflict}"
+                                store.waiter_error(token, detail)
+                                print(detail, file=sys.stderr, flush=True)
+                                continue
+                            except SinkUnsupported as unsupported:
+                                # No safe way to deliver: nothing is sent, and why is on record.
+                                detail = f"codex app-server queue API unsupported: {unsupported}"
+                                store.waiter_error(token, detail)
+                                if detail != reported_error:
+                                    print(detail, file=sys.stderr, flush=True)
+                                    reported_error = detail
+                                if sink is not None:
+                                    sink.close()
+                                sink = None
+                                stop.wait(CODEX_UNSUPPORTED_PAUSE_SECONDS)
+                                continue
+                            except (SinkTransportError, SinkError) as error:
+                                # The answer is lost or refused; the message stays marked and
+                                # unacknowledged, and the next attempt reads before it adds.
+                                detail = f"codex app-server {error} for message {message['id']}"
                                 store.waiter_error(token, detail)
                                 if detail != reported_error:
                                     print(
                                         f"Delivery failed for message {message['id']}; "
-                                        "retrying in 5 seconds",
+                                        f"retrying in {CODEX_RETRY_PAUSE_SECONDS} seconds",
                                         file=sys.stderr,
                                         flush=True,
                                     )
                                     reported_error = detail
-                                stop.wait(5)
+                                if sink is not None:
+                                    sink.close()
+                                sink = None
+                                stop.wait(CODEX_RETRY_PAUSE_SECONDS)
                                 continue
                         store.ack_for_token(token, message["id"])
                         reported_error = None
@@ -185,6 +226,9 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                     print(f"Waiter ended ({why}) but could not record it: {error}",
                           file=sys.stderr, flush=True)
                 return 0
+            finally:
+                if sink is not None:
+                    sink.close()
     finally:
         store.close()
 
