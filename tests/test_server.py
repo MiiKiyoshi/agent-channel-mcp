@@ -167,6 +167,55 @@ def test_graceful_close_is_immediately_offline_and_rejoin_reactivates(tmp_path):
         restarted.close()
 
 
+def test_responses_hide_fully_offline_roles_but_keep_delivery_and_reconnect(tmp_path):
+    path = tmp_path / "db"
+    offline = Channel(path)
+    offline_identity = offline.join("room", "write")["participant"]
+    offline.close()
+
+    waiting = Store(path)
+    waiting_identity = waiting.participant("room", "embed")
+    waiting.activate(waiting_identity["id"], "waiting-token")
+    waiting.waiter_started(waiting_identity["id"], "waiting-token", 12345)
+    with waiting.db:
+        waiting.db.execute(
+            "UPDATE participants SET connection_heartbeat_at=1 WHERE id=?",
+            (waiting_identity["id"],),
+        )
+    os.utime(waiting._presence_path("connection", "waiting-token"), (1, 1))
+    waiting.waiter_heartbeat("waiting-token")
+    waiting.close()
+
+    active = Channel(path)
+    restarted = Channel(path)
+    try:
+        joined = active.join("room", "lead")
+        assert active.store.registered_roles("room") == ["embed", "lead", "write"]
+        assert joined["registered_roles"] == ["embed", "lead"]
+        assert joined["role_statuses"] == [
+            {"name": "embed", "connection": "offline", "waiter": "active"},
+            {"name": "lead", "connection": "active", "waiter": "offline"}
+        ]
+
+        delivery = active.send("queued while offline", to="write")["deliveries"][0]
+        assert active.store.pending(offline_identity["id"])["id"] == delivery["message_id"]
+
+        renamed = active.rename("mcp")
+        assert renamed["registered_roles"] == ["embed", "mcp"]
+        assert renamed["role_statuses"] == [
+            {"name": "embed", "connection": "offline", "waiter": "active"},
+            {"name": "mcp", "connection": "active", "waiter": "offline"}
+        ]
+
+        rejoined = restarted.join("room", "write")
+        assert rejoined["participant"] == offline_identity
+        assert rejoined["registered_roles"] == ["embed", "mcp", "write"]
+        assert active.store.pending(offline_identity["id"])["id"] == delivery["message_id"]
+    finally:
+        active.close()
+        restarted.close()
+
+
 def test_abrupt_client_exit_becomes_offline_after_connection_lease(tmp_path):
     path = tmp_path / "db"
     repository = Path(__file__).resolve().parents[1]
@@ -240,11 +289,13 @@ def test_instructions_lead_from_join_to_waiter_command(tmp_path):
         assert "waiter=offline, start command using how" in instructions
         assert "Do not poll or start duplicate waiters" in instructions
         assert "Do not poll" in instructions
-        # The joiner is briefed by plan; what plan says still binds only by the user's word.
-        assert "After joining, send to the room's plan first" in instructions
-        assert "plan sends the current state, settled contracts, assets and your tasks" in instructions
-        assert instructions.index("send to the room's plan first") \
+        # The invitation names the handoff role; its briefing still binds only by the user's word.
+        assert "After joining, send first to the handoff role named in the invitation" in instructions
+        assert "That role sends the current state, settled contracts, assets and your tasks" in instructions
+        assert instructions.index("handoff role named in the invitation") \
             < instructions.index("explicitly delegated authority")
+        assert "room's plan" not in instructions
+        assert "handoff role to contact" in join
         assert "takes ownership" in join
         assert "omit to to broadcast" in descriptions["send"]
         assert "room is required when joined to more than one" in descriptions["send"]

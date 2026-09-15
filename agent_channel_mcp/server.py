@@ -63,8 +63,7 @@ class Channel:
             "participant": self.identities[room],
             "rooms": sorted(self._owned_rooms()),
             "policy": self.store.policy(room),
-            "registered_roles": self.store.registered_roles(room),
-            "role_statuses": self.store.role_statuses(room),
+            **self._visible_roles(room),
             **self._waiting(room, client_name),
         }
         failures = {
@@ -82,6 +81,16 @@ class Channel:
             room for room, identity in self.identities.items()
             if self.store.is_active(identity["id"], self.token)
         ]
+
+    def _visible_roles(self, room: str) -> dict:
+        statuses = [
+            status for status in self.store.role_statuses(room)
+            if status["connection"] == "active" or status["waiter"] == "active"
+        ]
+        return {
+            "registered_roles": [status["name"] for status in statuses],
+            "role_statuses": statuses,
+        }
 
     def require_identity(self, room: str) -> dict:
         identity = self.identities[room]
@@ -119,8 +128,7 @@ class Channel:
         self.identities[room] = self.store.rename(identity["id"], name, token=self.token)
         return {
             "participant": self.identities[room],
-            "registered_roles": self.store.registered_roles(room),
-            "role_statuses": self.store.role_statuses(room),
+            **self._visible_roles(room),
         }
 
     def leave(self, room: str | None = None) -> dict:
@@ -437,7 +445,7 @@ def create_server(channel: Channel) -> FastMCP:
     "Use only across different session systems; same-system sessions use native communication. "
     "On each new MCP connection or restart, join each room again. If waiter=offline, start command using how; "
     "if active, do nothing. Do not poll or start duplicate waiters. "
-    "After joining, send to the room's plan first (if it has one); plan sends the current state, "
+    "After joining, send first to the handoff role named in the invitation. That role sends the current state, "
     "settled contracts, assets and your tasks. "
     "Delivery starts with 'id room sender'; deduplicate by id. Wrap body lines at 500 UTF-16 code units. "
     "With several rooms joined, pass room to send, rename and leave. Follow the room's policy from join. "
@@ -449,10 +457,9 @@ def create_server(channel: Channel) -> FastMCP:
         """Join or create a room; call again to add rooms. When asked to create one, choose
         a descriptive name; otherwise ask before creating. Roles: short, distinct, no
         whitespace (plan, exec, discuss). Invitation (text, not a link): brief role purpose,
-        join(room="...", name="<peer role>"), "Follow how if waiter is offline; if active,
+        handoff role to contact, join(room="...", name="<peer role>"), "Follow how if offline; if active,
         do nothing." No detailed work context. command/how only while waiter is offline.
-        Rejoining with same room/name takes ownership. policy sets room rules; join
-        returns them."""
+        Same room/name takes ownership. policy sets and join returns room rules."""
         return channel.join(room, name, ctx.session.client_params.clientInfo.name, policy)
 
     @mcp.tool()
