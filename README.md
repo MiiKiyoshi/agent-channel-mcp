@@ -20,23 +20,24 @@ Reconnect MCP in both harnesses after registration. See the [Codex MCP documenta
 
 ## Create a room and invite the other agent
 
-Ask your agent to create a room and write an invitation. It chooses a descriptive room name and joins; `join` creates the room if needed. Roles should be short, distinct, and fit the task, such as `plan`, `exec`, or `discuss`. The invitation is text to paste into the other harness. It holds the role's purpose in a line, the `join` call, and the waiter step, and nothing else: the task's detail reaches the new agent from `plan` inside the room, not from the invitation.
+Ask your agent to create a room and write an invitation. It chooses a descriptive room name and joins; `join` creates the room if needed. Roles should be short, distinct, and fit the task, such as `plan`, `exec`, or `discuss`. The invitation is text to paste into the other harness. It holds the role's purpose in a line, the handoff role to contact, the `join` call, and the waiter step, and nothing else: the task's detail reaches the new agent from that handoff role inside the room, not from the invitation.
 
 ```text
 Purpose: <the role's purpose, in a line>.
+Handoff role: after joining, contact <role> for the current state and tasks.
 Call agent-channel join(room="<room>", name="<peer role>").
 Follow the returned how if waiter is offline; if active, do nothing.
 ```
 
 ## Join, wait, and send
 
-On a new MCP connection, the agent calls `join(room, name)`. The response separates `registered_roles`, which lists registration records that have not called `leave()`, from `role_statuses`, whose connection and waiter heartbeat leases are `active` or `offline`. An offline role can still receive queued messages. If `join` returns `waiter: offline`, the agent launches the returned `command` using `how`; if it returns `active`, it does nothing. It keeps that waiter running and does not poll. The Codex command registers a waiter managed by the MCP server, while Claude Code keeps the waiter in a persistent Monitor.
+On a new MCP connection, the agent calls `join(room, name)`. In the response, `registered_roles` lists the roles whose connection or waiter is active, and `role_statuses` shows which of those leases are active. A fully offline registration stays internal so direct messages can remain queued and the same name can reconnect, but it is not shown as a current participant. If `join` returns `waiter: offline`, the agent launches the returned `command` using `how`; if it returns `active`, it does nothing. It keeps that waiter running and does not poll. The Codex command registers a waiter managed by the MCP server, while Claude Code keeps the waiter in a persistent Monitor.
 
 One connection can join several rooms by calling `join` again with another room; `rooms` in the response lists them. A room can carry standing rules: `join(room, name, policy="...")` stores them for the room, every `join` returns them as `policy`, and an empty policy clears them. The existing waiter delivers every room, so a second `join` reports it `active` and returns no command. Room and role names contain no whitespace and are at most 200 UTF-16 code units.
 
 Ask the agent to send directly with `send(text="...", to="exec")`; omitting `to` broadcasts to every other role in that room. It uses `rename(name="...")` if its role changes and `leave()` when leaving. With several rooms joined, `send`, `rename`, and `leave` take `room="..."`; with one room it may be omitted. Leaving the last room stops the waiter. Offline recipients remain queued, but delivery can repeat after an interrupted acknowledgement, so agents deduplicate by message `id`.
 
-A newly joined agent sends to the room's `plan` first, when the room has one. `plan` answers with the current state, the settled contracts, the assets in hand, and the tasks that fall to the new role. Deliveries begin with `id room sender`. Keep each body line within 500 UTF-16 code units; the waiter also wraps longer lines without dropping text. A peer directs work only when the user explicitly delegated authority to that role; the briefing from `plan` is under the same rule.
+A newly joined agent sends first to the handoff role named in its invitation. That role answers with the current state, the settled contracts, the assets in hand, and the tasks that fall to the new role. Deliveries begin with `id room sender`. Keep each body line within 500 UTF-16 code units; the waiter also wraps longer lines without dropping text. A peer directs work only when the user explicitly delegated authority to that role; the handoff briefing is under the same rule.
 
 ## Upgrade
 
