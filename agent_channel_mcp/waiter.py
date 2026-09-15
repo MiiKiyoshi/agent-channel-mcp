@@ -25,6 +25,8 @@ CODEX_RETRY_PAUSE_SECONDS = 5
 CODEX_UNSUPPORTED_PAUSE_SECONDS = 30
 # A message handed over once and not found at the thread is looked for again this often.
 CODEX_UNCERTAIN_PAUSE_SECONDS = 10
+# The per-thread delivery lock is waited for this long before the attempt is given up.
+CODEX_LOCK_TIMEOUT_SECONDS = 60
 
 
 class DeliveryUncertain(Exception):
@@ -90,14 +92,32 @@ def render_message(message: dict) -> str:
     return "\n".join(output)
 
 
-def delivery_lock(db: Path, thread_id: str):
+def delivery_lock(db: Path, thread_id: str, stop: threading.Event):
     """The lock every waiter of this database takes around one look-then-add on a
     receiving thread, so two of them (an old one still running, a new one after a
-    takeover) cannot both find nothing and both add. Released when the handle closes."""
+    takeover) cannot both find nothing and both add. Released when the handle closes.
+    Waited for in short steps: a `stop` ends the wait at once, and a holder that
+    keeps it past CODEX_LOCK_TIMEOUT_SECONDS ends it with an error, both as
+    SinkTransportError so that the attempt is given up without a mark or an add."""
     safe = re.sub(r"[^A-Za-z0-9_-]", "_", thread_id)[:80]
     handle = _open_lock_file(db.with_name(f"{db.name}.{safe}.deliver.lock"), os.O_RDWR | os.O_CREAT)
-    fcntl.flock(handle, fcntl.LOCK_EX)
-    return handle
+    deadline = time.monotonic() + CODEX_LOCK_TIMEOUT_SECONDS
+    try:
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except BlockingIOError:
+                if stop.is_set():
+                    raise SinkTransportError("stopped before the delivery lock was taken") from None
+                if time.monotonic() >= deadline:
+                    raise SinkTransportError(
+                        f"delivery lock for thread {thread_id} held elsewhere for "
+                        f"{CODEX_LOCK_TIMEOUT_SECONDS:g} s") from None
+                stop.wait(0.1)
+    except BaseException:
+        handle.close()
+        raise
 
 
 def deliver_to_codex(store: Store, sink: CodexSink, thread_id: str, message: dict, text: str,
@@ -120,7 +140,7 @@ def deliver_to_codex(store: Store, sink: CodexSink, thread_id: str, message: dic
     add then goes to the old thread, and the new waiter, seeing the mark, looks for
     the message in its own thread and reports it uncertain."""
     key = f"agent-channel:{store.channel_id}:{message['id']}"
-    handle = delivery_lock(store.path, thread_id)
+    handle = delivery_lock(store.path, thread_id, sink.stop)
     try:
         # Read under the lock: another waiter may have marked and added it meanwhile.
         if store.attempted(message["id"]):
@@ -153,16 +173,14 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                 store.waiter_started(participant_id, token, os.getpid())
             next_heartbeat = time.monotonic()
             reported_error = None
-            recorded_error = None                     # the detail last written to the run row
+            failed: set[str] = set()                  # details written since the last acknowledgement
 
             def record(detail: str) -> None:
-                # The run row carries the failure once; a repeat of the same detail
-                # (an uncertain message looked for again, an app-server still absent)
-                # is not another write.
-                nonlocal recorded_error
-                if detail != recorded_error:
+                # An app-server failure is written to the run row once per streak: the
+                # same detail again, for the same or another message, is not a write.
+                if detail not in failed:
                     store.waiter_error(token, detail)
-                    recorded_error = detail
+                    failed.add(detail)
             sink: CodexSink | None = None
             conflicted: set[int] = set()
             uncertain: dict[int, float] = {}          # message id -> when to look again
@@ -202,21 +220,22 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                                 continue
                             except KeyConflict as conflict:
                                 # Permanent: the key is taken by other text. Not acknowledged,
-                                # not added, not tried again; said once and left to a person.
-                                conflicted.add(message["id"])
-                                uncertain.pop(message["id"], None)
-                                detail = f"key conflict for message {message['id']}: {conflict}"
-                                record(detail)
-                                print(detail, file=sys.stderr, flush=True)
+                                # not added, not tried again; written and said once.
+                                if message["id"] not in conflicted:
+                                    conflicted.add(message["id"])
+                                    uncertain.pop(message["id"], None)
+                                    detail = f"key conflict for message {message['id']}: {conflict}"
+                                    store.waiter_error(token, detail)
+                                    print(detail, file=sys.stderr, flush=True)
                                 continue
                             except DeliveryUncertain as why:
                                 # Handed over once, found nowhere: not added again, not
-                                # acknowledged; looked for again later, said once.
-                                first = message["id"] not in uncertain
-                                uncertain[message["id"]] = time.monotonic() + CODEX_UNCERTAIN_PAUSE_SECONDS
-                                record(str(why))
-                                if first:
+                                # acknowledged; looked for again later. Written and said
+                                # once, when the doubt begins; the later looks write nothing.
+                                if message["id"] not in uncertain:
+                                    store.waiter_error(token, str(why))
                                     print(why, file=sys.stderr, flush=True)
+                                uncertain[message["id"]] = time.monotonic() + CODEX_UNCERTAIN_PAUSE_SECONDS
                                 continue
                             except SinkUnsupported as unsupported:
                                 # No safe way to deliver: nothing is sent, and why is on record.
@@ -251,7 +270,7 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                         store.ack_for_token(token, message["id"])
                         uncertain.pop(message["id"], None)
                         reported_error = None
-                        recorded_error = None
+                        failed.clear()
                     except sqlite3.OperationalError as error:
                         # Another process holds the database. Keep serving; a message
                         # delivered before a busy ack is repeated and deduplicated by id.

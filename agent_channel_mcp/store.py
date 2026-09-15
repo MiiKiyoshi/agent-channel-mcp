@@ -13,7 +13,9 @@ PRESENCE_LEASE_SECONDS = 15
 # Bumped when the tables or columns change; a store at this version skips the setup
 # transaction, so opening a connection takes no write lock.
 # 2: meta(channel_id) and messages.attempted, for delivery keys a receiver can recognise.
-SCHEMA_VERSION = 2
+# 3: every message unacknowledged at the upgrade is marked attempted: an earlier
+#    delivery may have reached its receiver without a key to recognise it by.
+SCHEMA_VERSION = 3
 # A token names presence files beside the database; it is a file-name component.
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
@@ -149,6 +151,12 @@ class Store:
                 self.db.execute(
                     "ALTER TABLE messages ADD COLUMN attempted INTEGER NOT NULL DEFAULT 0"
                 )
+            if version < 3:
+                # Whatever was pending before this version may already be at its
+                # receiver from a delivery that carried no key; handing it over again
+                # blind would repeat it. Marked, it is only looked for, and stays
+                # pending as uncertain unless found; a person sends it again.
+                self.db.execute("UPDATE messages SET attempted=1 WHERE acknowledged=0")
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
@@ -474,19 +482,23 @@ class Store:
 
     def pending_for_token(self, token: str, excluding: set[int] = frozenset()) -> dict | None:
         """Oldest unacknowledged message across every room this connection holds,
-        leaving out the ids in `excluding` (ones the waiter has given up on)."""
-        skipped = sorted(excluding)
-        row = self.db.execute(
+        leaving out the ids in `excluding` (ones the waiter has given up on for now).
+        The excluded ids are skipped here, not in SQL: however many there are, the
+        statement has one variable, and among the oldest len(excluding)+1 pending
+        messages at least one is not excluded."""
+        rows = self.db.execute(
             "SELECT m.id, s.room, s.name AS sender, r.id AS recipient_id, r.name AS recipient, "
             "m.text, m.attempted "
             "FROM messages m JOIN participants s ON s.id=m.sender_id "
             "JOIN participants r ON r.id=m.recipient_id "
             "WHERE r.token=? AND r.left_at IS NULL AND m.acknowledged=0 "
-            + ("AND m.id NOT IN (" + ",".join("?" * len(skipped)) + ") " if skipped else "")
-            + "ORDER BY m.id LIMIT 1",
-            (token, *skipped),
-        ).fetchone()
-        return dict(row) if row is not None else None
+            "ORDER BY m.id LIMIT ?",
+            (token, len(excluding) + 1),
+        )
+        for row in rows:
+            if row["id"] not in excluding:
+                return dict(row)
+        return None
 
     @property
     def channel_id(self) -> str:

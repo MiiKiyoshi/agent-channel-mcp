@@ -147,15 +147,21 @@ class CodexSink:
 
     # --- the delivery itself ---
 
-    def _pages(self, method: str, params: dict) -> list:
-        entries = []
+    def _pages(self, method: str, params: dict):
+        """The entries of a paginated listing, one page at a time, so that a caller
+        that stops at the first match reads no further page. A cursor seen before
+        is a SinkError: the listing would never end."""
         cursor = None
+        seen = set()
         while True:
             page = self.call(method, {**params, "cursor": cursor})
-            entries.extend(page.get("data", []))
+            yield from page.get("data", [])
             cursor = page.get("nextCursor")
             if not cursor:
-                return entries
+                return
+            if cursor in seen:
+                raise SinkError(f"{method} repeats cursor {cursor!r}")
+            seen.add(cursor)
 
     def find(self, thread_id: str, key: str, text: str) -> str | None:
         """Where a delivery with this key already is: "queued", "consumed", or None.
