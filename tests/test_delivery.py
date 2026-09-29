@@ -450,6 +450,39 @@ def test_waiter_prints_a_long_message_as_parts_far_enough_apart(tmp_path):
         store.close()
 
 
+def test_waiter_keeps_back_to_back_messages_apart(tmp_path):
+    db = tmp_path / "channel.sqlite3"
+    store = Store(db)
+    sender = store.participant("room", "sender")
+    receiver = store.participant("room", "receiver")
+    token = "session-token"
+    _active(store, receiver, token)
+    # Both are pending before the waiter starts, so it prints them one right after the other.
+    # Each fits in one part, but together they pass what one Monitor event shows.
+    first = send_one(store, sender["id"], receiver["name"], "\n".join("a" * 99 for _ in range(17)))
+    second = send_one(store, sender["id"], receiver["name"], "\n".join("b" * 99 for _ in range(24)))
+    process = subprocess.Popen(_waiter_command(db, token), stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True)
+    try:
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        assert selector.select(timeout=4), process.stderr.read()
+        selector.close()
+        arrivals = {}
+        while len(arrivals) < 2:
+            line = process.stdout.readline()
+            assert line, process.stderr.read()
+            for message_id in (first, second):
+                if line == f"{message_id} room sender\n":
+                    arrivals[message_id] = time.monotonic()
+        # Lines printed within 200 ms of each other would reach Claude Code as one event.
+        assert arrivals[second] - arrivals[first] >= PART_PAUSE_SECONDS * 0.8
+        wait_for(lambda: store.pending(receiver["id"]) is None)
+    finally:
+        _stop_waiter(process, store, token)
+        store.close()
+
+
 def test_only_one_waiter_holds_participant_lock(tmp_path):
     db = tmp_path / "channel.sqlite3"
     store = Store(db)

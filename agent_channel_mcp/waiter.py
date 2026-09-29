@@ -29,7 +29,8 @@ CODEX_UNCERTAIN_PAUSE_SECONDS = 10
 CODEX_LOCK_TIMEOUT_SECONDS = 60
 # Claude Code shows about the first 3,000 characters of one Monitor event, and lines
 # printed within 200 ms of each other become one event. A longer delivery therefore
-# goes out as parts of at most this many characters, printed this far apart.
+# goes out as parts of at most this many characters, and no two prints, parts of one
+# message or of back-to-back messages, come closer than this.
 PART_CHARS = 2500
 PART_PAUSE_SECONDS = 0.5
 
@@ -215,6 +216,7 @@ def run(db: Path, token: str, codex_thread: str | None = None,
             sink: CodexSink | None = None
             conflicted: set[int] = set()
             uncertain: dict[int, float] = {}          # message id -> when to look again
+            printed_at = float("-inf")                # when the last part went to stdout
             try:
                 if codex_thread is not None:
                     if not codex_thread.strip():
@@ -239,10 +241,12 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                             continue
                         text = render_message(message)
                         if codex_thread is None:
-                            for number, part in enumerate(render_parts(message)):
-                                if number:
-                                    stop.wait(PART_PAUSE_SECONDS)
+                            # Every print keeps its distance from the one before, a part
+                            # of this message or the last part of the previous one.
+                            for part in render_parts(message):
+                                stop.wait(max(0.0, printed_at + PART_PAUSE_SECONDS - time.monotonic()))
                                 print(part, flush=True)
+                                printed_at = time.monotonic()
                         else:
                             try:
                                 if sink is None:
