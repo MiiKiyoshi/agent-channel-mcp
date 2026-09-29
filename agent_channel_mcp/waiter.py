@@ -27,6 +27,11 @@ CODEX_UNSUPPORTED_PAUSE_SECONDS = 30
 CODEX_UNCERTAIN_PAUSE_SECONDS = 10
 # The per-thread delivery lock is waited for this long before the attempt is given up.
 CODEX_LOCK_TIMEOUT_SECONDS = 60
+# Claude Code shows about the first 3,000 characters of one Monitor event, and lines
+# printed within 200 ms of each other become one event. A longer delivery therefore
+# goes out as parts of at most this many characters, printed this far apart.
+PART_CHARS = 2500
+PART_PAUSE_SECONDS = 0.5
 
 
 class DeliveryUncertain(Exception):
@@ -81,15 +86,41 @@ def render_message(message: dict) -> str:
     text = f"{message['id']} {message['room']} {message['sender']}\n{message['text']}"
     for line in text.split("\n"):
         start = width = 0
+        space = -1                      # the last whitespace in the current segment
         for index, char in enumerate(line):
             # Count UTF-16 units so a non-BMP character cannot straddle the limit.
             size = 2 if ord(char) > 0xFFFF else 1
             if width + size > 500:
-                output.append(line[start:index])
-                start, width = index, 0
+                # Break after the segment's last whitespace, so a word stays whole,
+                # and inside the word only when the segment has none.
+                cut = space + 1 if space > start else index
+                output.append(line[start:cut])
+                start, space = cut, -1
+                width = len(line[start:index].encode("utf-16-le")) // 2
             width += size
+            if char.isspace():
+                space = index
         output.append(line[start:])
     return "\n".join(output)
+
+
+def render_parts(message: dict) -> list[str]:
+    """The rendered message as parts of at most PART_CHARS characters, split between
+    lines. More than one part are headed `id room sender k/n`."""
+    header, *body = render_message(message).split("\n")
+    room = PART_CHARS - len(header) - 12        # the header and its " k/n" suffix
+    parts: list[list[str]] = [[]]
+    size = 0
+    for line in body:
+        if parts[-1] and size + len(line) + 1 > room:
+            parts.append([])
+            size = 0
+        parts[-1].append(line)
+        size += len(line) + 1
+    if len(parts) == 1:
+        return ["\n".join([header, *parts[0]])]
+    return [f"{header} {number}/{len(parts)}\n" + "\n".join(lines)
+            for number, lines in enumerate(parts, 1)]
 
 
 def delivery_lock(db: Path, thread_id: str, stop: threading.Event):
@@ -208,7 +239,10 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                             continue
                         text = render_message(message)
                         if codex_thread is None:
-                            print(text, flush=True)
+                            for number, part in enumerate(render_parts(message)):
+                                if number:
+                                    stop.wait(PART_PAUSE_SECONDS)
+                                print(part, flush=True)
                         else:
                             try:
                                 if sink is None:

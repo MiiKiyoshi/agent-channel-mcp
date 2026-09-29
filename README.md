@@ -20,11 +20,11 @@ Reconnect MCP in both harnesses after registration. See the [Codex MCP documenta
 
 ## Create a room and invite the other agent
 
-Ask your agent to create a room and write an invitation. It chooses a descriptive room name and joins; `join` creates the room if needed. Roles should be short, distinct, and fit the task, such as `plan`, `exec`, or `discuss`. The invitation is text to paste into the other harness. It holds the role's purpose in a line, the handoff role to contact, the `join` call, and the waiter step, and nothing else: the task's detail reaches the new agent from that handoff role inside the room, not from the invitation.
+Ask your agent to create a room and write an invitation. It chooses a descriptive room name and joins; `join` creates the room if needed. Roles should be short, distinct, and fit the task, such as `plan`, `exec`, or `discuss`. The agent ends its reply with the whole invitation, text to paste into the other harness, and does not start that session itself. The invitation holds the room's purpose in a line, whom to contact first, the `join` call, and the waiter step, and nothing else. The task's detail reaches the new agent inside the room, not from the invitation.
 
 ```text
-Purpose: <the role's purpose, in a line>.
-Handoff role: after joining, contact <role> for the current state and tasks.
+Purpose: <the room's purpose, in a line>.
+Contact first: <role>.
 Call agent-channel join(room="<room>", name="<peer role>").
 Follow the returned how if waiter is offline; if active, do nothing.
 ```
@@ -35,9 +35,9 @@ On a new MCP connection, the agent calls `join(room, name)`. In the response, `r
 
 One connection can join several rooms by calling `join` again with another room; `rooms` in the response lists them. A room can carry standing rules: `join(room, name, policy="...")` stores them for the room, every `join` returns them as `policy`, and an empty policy clears them. The existing waiter delivers every room, so a second `join` reports it `active` and returns no command. Room and role names contain no whitespace and are at most 200 UTF-16 code units.
 
-Ask the agent to send directly with `send(text="...", to="exec")`; omitting `to` broadcasts to every other role in that room. It uses `rename(name="...")` if its role changes and `leave()` when leaving. With several rooms joined, `send`, `rename`, and `leave` take `room="..."`; with one room it may be omitted. Leaving the last room stops the waiter. Offline recipients remain queued, but delivery can repeat after an interrupted acknowledgement, so agents deduplicate by message `id`.
+Ask the agent to send directly with `send(text="...", to="exec")`; omitting `to` broadcasts to every other role in that room. It uses `rename(name="...")` if its role changes and `leave()` when leaving. With several rooms joined, `send`, `rename`, and `leave` take `room="..."`; with one room it may be omitted. Leaving the last room stops the waiter. Offline recipients remain queued, but delivery can repeat after an interrupted acknowledgement, so agents deduplicate by message `id` and part.
 
-A newly joined agent sends first to the handoff role named in its invitation. That role answers with the current state, the settled contracts, the assets in hand, and the tasks that fall to the new role. Deliveries begin with `id room sender`. Keep each body line within 500 UTF-16 code units; the waiter also wraps longer lines without dropping text. A peer directs work only when the user explicitly delegated authority to that role; the handoff briefing is under the same rule.
+A newly joined agent contacts the participant named in its invitation first, and the two exchange the context the room's purpose needs. Joining assigns no work or authority. A peer directs work only when the user explicitly delegated authority to that role. Deliveries begin with `id room sender`. The waiter wraps body lines at 500 UTF-16 code units, after a space when the line has one, without dropping text. A Claude Code Monitor shows only about the first 3,000 characters of one event, so the waiter prints a longer delivery as parts headed `id room sender k/n`, half a second apart.
 
 ## Upgrade
 

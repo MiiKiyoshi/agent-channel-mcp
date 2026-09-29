@@ -14,7 +14,7 @@ import pytest
 
 from agent_channel_mcp.store import PRESENCE_LEASE_SECONDS, Store
 from agent_channel_mcp.server import Channel
-from agent_channel_mcp.waiter import render_message
+from agent_channel_mcp.waiter import PART_CHARS, PART_PAUSE_SECONDS, render_message, render_parts
 from fake_app_server import FakeCodex
 
 
@@ -383,6 +383,71 @@ def test_forced_wrap_preserves_text_and_existing_newlines(body, expected):
     actual = render_message({"id": 42, "room": "room", "sender": "claude", "text": body})
     assert actual == "42 room claude\n" + expected
     assert all(len(line.encode("utf-16-le")) <= 1000 for line in actual.split("\n"))
+
+
+def test_wrap_breaks_after_a_space_and_keeps_every_character():
+    body = "word " * 150 + "x" * 520 + " tail"
+    rendered = render_message({"id": 42, "room": "room", "sender": "claude", "text": body})
+    lines = rendered.split("\n")[1:]
+    assert "".join(lines) == body
+    assert all(len(line.encode("utf-16-le")) // 2 <= 500 for line in lines)
+    # A segment with a space ends after it, so no word is cut. The run of x has none.
+    assert lines[0].endswith(" ") and lines[0] == "word " * 100
+    assert lines[1] == "word " * 50
+    assert lines[2] == "x" * 500
+
+
+def test_a_short_message_is_one_part():
+    message = {"id": 7, "room": "room", "sender": "codex", "text": "hello\nthere"}
+    assert render_parts(message) == [render_message(message)]
+
+
+def test_a_long_message_is_split_between_lines_into_numbered_parts():
+    body = "\n".join(f"{n:03d} " + "y" * 95 for n in range(80))    # 80 lines, 8,000 characters
+    message = {"id": 7, "room": "room", "sender": "codex", "text": body}
+    parts = render_parts(message)
+    assert len(parts) == 4
+    assert all(len(part) <= PART_CHARS for part in parts)
+    assert [part.split("\n")[0] for part in parts] == [f"7 room codex {k}/4" for k in range(1, 5)]
+    assert "\n".join(part.split("\n", 1)[1] for part in parts) == body
+
+
+def test_waiter_prints_a_long_message_as_parts_far_enough_apart(tmp_path):
+    db = tmp_path / "channel.sqlite3"
+    store = Store(db)
+    sender = store.participant("room", "sender")
+    receiver = store.participant("room", "receiver")
+    token = "session-token"
+    _active(store, receiver, token)
+    process = subprocess.Popen(_waiter_command(db, token), stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True)
+    body = "\n".join("z" * 99 for _ in range(60))                    # 6,000 characters
+    try:
+        message_id = send_one(store, sender["id"], receiver["name"], body)
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        assert selector.select(timeout=4), process.stderr.read()
+        selector.close()
+        headers, arrivals, lines = [], [], []
+        while len(headers) < 3:
+            line = process.stdout.readline()
+            assert line, process.stderr.read()
+            if line.startswith(f"{message_id} room sender"):
+                headers.append(line.rstrip("\n"))
+                arrivals.append(time.monotonic())
+            else:
+                lines.append(line.rstrip("\n"))
+        while len(lines) < 60:
+            lines.append(process.stdout.readline().rstrip("\n"))
+        assert headers == [f"{message_id} room sender {k}/3" for k in (1, 2, 3)]
+        assert lines == ["z" * 99] * 60
+        # Lines printed within 200 ms of each other would reach Claude Code as one event.
+        assert all(later - earlier >= PART_PAUSE_SECONDS * 0.8
+                   for earlier, later in zip(arrivals, arrivals[1:]))
+        wait_for(lambda: store.pending(receiver["id"]) is None)
+    finally:
+        _stop_waiter(process, store, token)
+        store.close()
 
 
 def test_only_one_waiter_holds_participant_lock(tmp_path):
