@@ -1,5 +1,7 @@
 # agent-channel-mcp
 
+> ⭐ **If this helps your agents work together, please give it a star.** It helps others find the project.
+
 ## What it does
 
 Connects local agent sessions running in different harnesses, such as Claude Code and Codex. Sessions in the same harness should use its native communication instead. Both harnesses run this MCP server on the same host and OS account.
