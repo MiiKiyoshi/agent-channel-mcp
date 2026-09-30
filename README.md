@@ -1,72 +1,26 @@
 # agent-channel-mcp
 
+Let a Claude Code session and a Codex session on the same machine talk to each other.
+
 > ⭐ **If this helps your agents work together, please give it a star.** It helps others find the project.
 
-## What it does
+## Install
 
-Connects local agent sessions running in different harnesses, such as Claude Code and Codex. Sessions in the same harness should use its native communication instead. Both harnesses run this MCP server on the same host and OS account.
+Paste this into Claude Code or Codex:
 
-## Install and connect
-
-Requires Python 3.10 or newer, [`uv`](https://docs.astral.sh/uv/), and a harness with MCP support.
-
-```sh
-git clone https://github.com/MiiKiyoshi/agent-channel-mcp.git
-cd agent-channel-mcp
-uv sync
-claude mcp add --scope user agent-channel -- uv run --directory "$PWD" --no-sync agent-channel-mcp
-codex mcp add agent-channel -- uv run --directory "$PWD" --no-sync agent-channel-mcp
+```
+Install agent-channel-mcp by following https://raw.githubusercontent.com/MiiKiyoshi/agent-channel-mcp/main/INSTALL.md
 ```
 
-Reconnect MCP in both harnesses after registration. See the [Codex MCP documentation](https://developers.openai.com/codex/mcp) for Codex configuration details.
+The agent shows you what it will install and registers it with both agents once you agree.
+Start both agents again afterwards.
 
-## Create a room and invite the other agent
+## Connect two agents
 
-Ask your agent to create a room and write an invitation. It chooses a descriptive room name and joins; `join` creates the room if needed. Roles should be short, distinct, and fit the task, such as `plan`, `exec`, or `discuss`. The agent ends its reply with the whole invitation, text to paste into the other harness, and does not start that session itself. The invitation holds the room's purpose in a line, whom to contact first, the `join` call, and the waiter step, and nothing else. The task's detail reaches the new agent inside the room, not from the invitation.
+Ask one agent to make a room, for example "make an agent-channel room to review this plan
+with Codex". It ends its reply with an invitation. Paste the invitation into the other agent.
 
-```text
-Purpose: <the room's purpose, in a line>.
-Contact first: <role>.
-Call agent-channel join(room="<room>", name="<peer role>").
-Follow the returned how if waiter is offline; if active, do nothing.
-```
+The two agents then message each other in the room. Each takes direction from you, and from
+the other agent only when you say so.
 
-## Join, wait, and send
-
-On a new MCP connection, the agent calls `join(room, name)`. In the response, `registered_roles` lists the roles whose connection or waiter is active, and `role_statuses` shows which of those leases are active. A fully offline registration stays internal so direct messages can remain queued and the same name can reconnect, but it is not shown as a current participant. If `join` returns `waiter: offline`, the agent launches the returned `command` using `how`; if it returns `active`, it does nothing. It keeps that waiter running and does not poll. The Codex command registers a waiter managed by the MCP server, while Claude Code keeps the waiter in a Monitor. A Monitor expires after 30 minutes and ends the waiter; on each expiry notice the agent calls `join` again, which returns `offline` and the same command. Messages sent meanwhile stay queued.
-
-One connection can join several rooms by calling `join` again with another room; `rooms` in the response lists them. A room can carry standing rules: `join(room, name, policy="...")` stores them for the room, every `join` returns them as `policy`, and an empty policy clears them. The existing waiter delivers every room, so a second `join` reports it `active` and returns no command. Room and role names contain no whitespace and are at most 200 UTF-16 code units.
-
-Ask the agent to send directly with `send(text="...", to="exec")`; omitting `to` broadcasts to every other role in that room. It uses `rename(name="...")` if its role changes and `leave()` when leaving. With several rooms joined, `send`, `rename`, and `leave` take `room="..."`; with one room it may be omitted. Leaving the last room stops the waiter. Offline recipients remain queued, but delivery can repeat after an interrupted acknowledgement, so agents deduplicate by message `id` and part.
-
-A newly joined agent contacts the participant named in its invitation first, and the two exchange the context the room's purpose needs. Joining assigns no work or authority. A peer directs work only when the user explicitly delegated authority to that role. Deliveries begin with `id room sender`. The waiter wraps body lines at 500 UTF-16 code units, after a space when the line has one, without dropping text. A Claude Code Monitor shows only about the first 3,000 characters of one event, so the waiter prints a longer delivery as parts headed `id room sender k/n`, half a second apart.
-
-## Upgrade
-
-A database from an earlier version is brought up to date when it is next opened. Messages that were still unacknowledged at that moment are marked as handed over once, since an earlier delivery may already have reached the receiver without a key to recognise it by: they are looked for, not added, and one that is not found stays pending as "delivery uncertain" until a person sends it again.
-
-## Restart or reconnect
-
-After either harness, client, or server restarts, tell the agent to join each of its rooms again and follow the live-status procedure above; the previous connection's room list is not restored automatically, and never assume its waiter survived. Joining the same room and role reuses the registration and recovers pending messages. A graceful exit becomes offline immediately; an interrupted process becomes offline when its short heartbeat lease expires. `leave()` removes the registration immediately but is not required for accurate live status.
-
-## Troubleshooting
-
-- **Recipient not found:** ask that agent to join the room, then tell the sending agent to call `join` again to refresh registered roles and live status.
-- **Messages do not arrive:** confirm both MCP registrations run under the same OS account. If either uses `--db`, both must use the same absolute path.
-- **Duplicate delivery:** tell the receiving agent to process each message `id` once. To a Codex thread the waiter adds a message at most once: it queues it under the key `agent-channel:<channel id>:<message id>` through a stock `codex app-server` child, and a message handed over once is never added again, only looked for in the thread's queue and items by that key.
-- **Codex message pending, `waiter_detail` says "delivery uncertain":** the message was handed over once, the answer was lost, and the key is in neither the queue nor the items. The app-server removes a queued message when its turn starts and records the item later, so the message may still appear; the waiter looks again every 10 seconds, acknowledges when it appears, and serves later messages meanwhile. A message that never appears stays pending with that note; delivering it again is a person's decision (it can be sent again as a new message). The same note follows a role taken over by a new connection in the instant between the old waiter's hand-over and its add: the message then sits in the old thread.
-- **Codex message not delivered, `waiter_detail` says "key conflict":** the message's key is held at the thread by a message with other text. It is not queued and not acknowledged; a person decides.
-- **`waiter_detail` says "queue API unsupported":** the installed `codex app-server` does not offer the thread queue API. Nothing is delivered to Codex until a Codex with that API is installed.
-- **Waiter will not start:** tell the agent to call `join`, start its command only for `offline`, and leave `active` alone.
-- **Waiter disappeared:** inspect `waiter_detail` from `join`. It records normal token shutdowns, signals, runtime errors, last heartbeat, and any failed delivery attempt. An abrupt kill becomes offline when its heartbeat lease expires.
-
-## Test and contribute
-
-Install development dependencies and run the full test suite before submitting a change:
-
-```sh
-uv sync --extra dev
-uv run --no-sync pytest -q
-```
-
-Tests use temporary databases and a fake `codex app-server`; the installed Codex is exercised in a private network namespace where `codex` and `unshare` are available. Live delivery checks require both real harnesses to be connected.
+After an agent restarts, tell it to join its rooms again.
