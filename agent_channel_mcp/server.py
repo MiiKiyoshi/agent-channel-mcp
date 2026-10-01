@@ -470,7 +470,8 @@ def create_server(channel: Channel) -> FastMCP:
     @mcp.tool()
     async def send(text: str, to: str | None = None, room: str | None = None) -> dict:
         """Send to one role, or omit to to broadcast to every other registered role.
-        room is required when joined to more than one room."""
+        room is required when joined to more than one room. A reply to a channel message goes
+        through send, to its room and sender. Text written to your own user does not reach the room."""
         return channel.send(text, to, room)
 
     @mcp.tool()

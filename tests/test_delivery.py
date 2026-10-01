@@ -14,7 +14,7 @@ import pytest
 
 from agent_channel_mcp.store import PRESENCE_LEASE_SECONDS, Store
 from agent_channel_mcp.server import Channel
-from agent_channel_mcp.waiter import PART_CHARS, PART_PAUSE_SECONDS, render_message, render_parts
+from agent_channel_mcp.waiter import PART_CHARS, PART_PAUSE_SECONDS, render_codex, render_message, render_parts
 from fake_app_server import FakeCodex
 
 
@@ -270,6 +270,18 @@ def _stop_waiter(process: subprocess.Popen, store: Store, token: str):
         process.stderr.close()
 
 
+def test_a_codex_delivery_says_how_a_reply_reaches_the_room():
+    """On a Codex thread a message sits in the user's turn. What it is handed ends with how
+    a reply reaches the room, kept apart from the sender's text and built from the delivery.
+    A Claude session reads the same message as a monitor event, and gets it unchanged."""
+    message = {"id": 42, "room": "deck-edit-postmortem", "sender": "claude", "text": "Please review.\nThanks"}
+    assert render_codex(message) == (
+        "42 deck-edit-postmortem claude\nPlease review.\nThanks\n\n"
+        '[agent-channel] If a reply is needed, call send with room="deck-edit-postmortem" and to="claude". '
+        "An answer in your own chat is not sent to this room.")
+    assert render_parts(message) == ["42 deck-edit-postmortem claude\nPlease review.\nThanks"]
+
+
 def test_a_waiter_whose_connection_closed_says_to_join_again(tmp_path):
     """A waiter is re-armed by running the same command again, without join. Once the
     connection behind it has closed, that command can only end, and it says so where the
@@ -378,7 +390,8 @@ def test_waiter_codex_queue_acks_and_preserves_message_text(tmp_path):
     )
     try:
         wait_for(lambda: store.pending(receiver["id"]) is None)
-        assert codex.texts("thread-42") == [f"{message_id} room sender\n{text}"]
+        assert codex.texts("thread-42") == [render_codex(
+            {"id": message_id, "room": "room", "sender": "sender", "text": text})]
         [item] = codex.items("thread-42")
         assert item["clientId"] == f"agent-channel:{store.channel_id}:{message_id}"
         assert not (tmp_path / "pwned").exists()
@@ -666,7 +679,8 @@ def test_mcp_managed_codex_waiter_outlives_launcher_and_delivers(
             channel.store, sender["id"], receiver["name"], "managed"
         )
         wait_for(lambda: channel.store.pending(receiver["id"]) is None)
-        assert codex.texts("thread-42") == [f"{message_id} room sender\nmanaged"]
+        assert codex.texts("thread-42") == [render_codex(
+            {"id": message_id, "room": "room", "sender": "sender", "text": "managed"})]
     finally:
         channel.store.deactivate(token)
         wait_for(

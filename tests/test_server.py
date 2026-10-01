@@ -11,6 +11,7 @@ from mcp.client.stdio import stdio_client
 from mcp.types import Implementation
 import pytest
 
+from agent_channel_mcp import waiter as waiter_module
 from agent_channel_mcp.server import Channel, create_server
 from agent_channel_mcp.store import PRESENCE_LEASE_SECONDS, Store
 from fake_app_server import FakeCodex
@@ -368,7 +369,9 @@ def test_two_stdio_clients_and_generated_waiter(tmp_path):
                 message_id = sent["deliveries"][0]["message_id"]
                 expected = (f"{message_id} design-review claude\n"
                             "quotes ' \" $(touch SHOULD_NOT_EXIST) `echo test`\n"
-                            + "x" * 500 + "\nx")
+                            + "x" * 500 + "\nx\n\n"
+                            '[agent-channel] If a reply is needed, call send with room="design-review" '
+                            'and to="claude". An answer in your own chat is not sent to this room.')
                 for _ in range(100):
                     if codex.texts("thread-42"):
                         break
@@ -389,7 +392,8 @@ def test_two_stdio_clients_and_generated_waiter(tmp_path):
                 sent = unpack(await a.call_tool(
                     "send", {"to": "codex", "text": "room two", "room": "second"}
                 ))
-                expected = f"{sent['deliveries'][0]['message_id']} second claude\nroom two"
+                expected = waiter_module.render_codex({"id": sent["deliveries"][0]["message_id"],
+                                                       "room": "second", "sender": "claude", "text": "room two"})
                 for _ in range(100):
                     if expected in codex.texts("thread-42"):
                         break

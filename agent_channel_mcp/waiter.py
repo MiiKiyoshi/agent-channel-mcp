@@ -2,6 +2,7 @@
 
 import argparse
 import fcntl
+import json
 import os
 import re
 import shutil
@@ -103,6 +104,15 @@ def render_message(message: dict) -> str:
                 space = index
         output.append(line[start:])
     return "\n".join(output)
+
+
+def render_codex(message: dict) -> str:
+    """A message as it is queued on a Codex thread, where it sits in the user's turn. After
+    the sender's text the server adds, marked as its own and built from the delivery, how a
+    reply reaches the room: only send does, and an answer in the final message does not."""
+    return (f"{render_message(message)}\n\n[agent-channel] If a reply is needed, call send with "
+            f"room={json.dumps(message['room'])} and to={json.dumps(message['sender'])}. "
+            "An answer in your own chat is not sent to this room.")
 
 
 def render_parts(message: dict) -> list[str]:
@@ -239,7 +249,6 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                         if message is None:
                             stop.wait(0.5)
                             continue
-                        text = render_message(message)
                         if codex_thread is None:
                             # Every print keeps its distance from the one before, a part
                             # of this message or the last part of the previous one.
@@ -251,7 +260,7 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                             try:
                                 if sink is None:
                                     sink = CodexSink(timeout=CODEX_QUEUE_TIMEOUT_SECONDS, stop=stop)
-                                deliver_to_codex(store, sink, codex_thread, message, text, token)
+                                deliver_to_codex(store, sink, codex_thread, message, render_codex(message), token)
                             except DeliveryNotOwned:
                                 # Taken over since the message was read: nothing handed
                                 # over; the next round finds the token inactive and ends.

@@ -14,7 +14,7 @@ import pytest
 from agent_channel_mcp import waiter as waiter_module
 from agent_channel_mcp.codex_sink import CodexSink, KeyConflict, SinkError, SinkTransportError, SinkUnsupported
 from agent_channel_mcp.store import Store
-from agent_channel_mcp.waiter import DeliveryNotOwned, DeliveryUncertain, deliver_to_codex, render_message
+from agent_channel_mcp.waiter import DeliveryNotOwned, DeliveryUncertain, deliver_to_codex, render_codex, render_message
 from fake_app_server import FakeCodex
 
 
@@ -26,6 +26,11 @@ def wait_for(predicate, timeout: float = 6.0):
             return value
         time.sleep(0.05)
     pytest.fail("timed out waiting")
+
+
+def queued(message_id, text):
+    """The text a waiter queues on a Codex thread for a message from plan in room."""
+    return render_codex({"id": message_id, "room": "room", "sender": "plan", "text": text})
 
 
 def _store_with_message(db, text="hello"):
@@ -66,7 +71,7 @@ def test_a_first_attempt_adds_without_reading_and_marks_the_message(tmp_path, mo
     assert message["attempted"] == 0
     sink = CodexSink(timeout=5)
     try:
-        assert deliver_to_codex(store, sink, "thread-1", message, render_message(message), "tok") == "added"
+        assert deliver_to_codex(store, sink, "thread-1", message, render_codex(message), "tok") == "added"
     finally:
         sink.close()
     assert codex.requests() == ["initialize", "thread/queue/add"]
@@ -79,7 +84,7 @@ def test_a_repeated_attempt_finds_the_message_and_does_not_add_it_again(tmp_path
     codex = FakeCodex(tmp_path / "bin").apply(monkeypatch)
     store, receiver, message_id = _store_with_message(tmp_path / "db")
     message = store.pending_for_token("tok")
-    text = render_message(message)
+    text = render_codex(message)
     sink = CodexSink(timeout=5)
     try:
         deliver_to_codex(store, sink, "thread-1", message, text, "tok")
@@ -90,9 +95,9 @@ def test_a_repeated_attempt_finds_the_message_and_does_not_add_it_again(tmp_path
         store.ack_for_token("tok", message_id)
         second = store.pending_for_token("tok")
         assert second["id"] == other
-        deliver_to_codex(store, sink, "thread-1", second, render_message(second), "tok")
+        deliver_to_codex(store, sink, "thread-1", second, render_codex(second), "tok")
         second = store.pending_for_token("tok")
-        assert deliver_to_codex(store, sink, "thread-1", second, render_message(second), "tok") == "queued"
+        assert deliver_to_codex(store, sink, "thread-1", second, render_codex(second), "tok") == "queued"
     finally:
         sink.close()
     assert codex.requests().count("thread/queue/add") == 2
@@ -128,13 +133,13 @@ def test_a_marked_message_found_nowhere_is_not_added_again_and_is_acknowledged_o
         # meets the same failure; here the add answers again.
         codex.set(drop_add_response=None, consume="immediate")
         later = store.send(store.participant("room", "plan")["id"], "later", to="exec")[0]["message_id"]
-        wait_for(lambda: f"{later} room plan\nlater" in codex.texts("thread-1"), timeout=12)
+        wait_for(lambda: queued(later, "later") in codex.texts("thread-1"), timeout=12)
         assert store.pending(receiver["id"])["id"] == message_id            # still first, still unacknowledged
         # The item becomes visible: the next look acknowledges, with no add.
         codex.arrive("thread-1")
         wait_for(lambda: store.pending(receiver["id"]) is None, timeout=12)
         assert codex.requests().count("thread/queue/add") == 2               # one per message
-        assert sorted(codex.texts("thread-1")) == sorted([f"{later} room plan\nlater", f"{message_id} room plan\nhello"])
+        assert sorted(codex.texts("thread-1")) == sorted([queued(later, "later"), queued(message_id, "hello")])
     finally:
         stop.set()
         thread.join(timeout=5)
@@ -194,7 +199,7 @@ def test_two_uncertain_messages_and_a_later_acknowledgement_write_nothing_more(t
         codex.set(drop_add_response=None, consume="immediate")
         later = store.send(plan["id"], "three", to="exec")[0]["message_id"]
         wait_for(lambda: store.pending(receiver["id"]) is not None
-                 and f"{later} room plan\nthree" in codex.texts("thread-1")
+                 and queued(later, "three") in codex.texts("thread-1")
                  and store.pending_for_token("tok", excluding={first, second}) is None)
         watcher = Store(tmp_path / "db")
         version = watcher.db.execute("PRAGMA data_version").fetchone()[0]
@@ -219,7 +224,7 @@ def test_the_delivery_raises_uncertain_for_a_marked_message_found_nowhere(tmp_pa
     sink = CodexSink(timeout=5)
     try:
         with pytest.raises(DeliveryUncertain, match=f"message {message_id}; not re-adding"):
-            deliver_to_codex(store, sink, "thread-1", message, render_message(message), "tok")
+            deliver_to_codex(store, sink, "thread-1", message, render_codex(message), "tok")
     finally:
         sink.close()
     store.close()
@@ -232,11 +237,11 @@ def test_an_answered_refusal_clears_the_mark_so_the_next_attempt_may_add(tmp_pat
     sink = CodexSink(timeout=5)
     try:
         with pytest.raises(SinkError, match="thread is busy"):
-            deliver_to_codex(store, sink, "thread-1", message, render_message(message), "tok")
+            deliver_to_codex(store, sink, "thread-1", message, render_codex(message), "tok")
         assert store.pending_for_token("tok")["attempted"] == 0
         codex.set(add_error=None)
         assert deliver_to_codex(store, sink, "thread-1", store.pending_for_token("tok"),
-                                render_message(message), "tok") == "added"
+                                render_codex(message), "tok") == "added"
     finally:
         sink.close()
     assert codex.requests().count("thread/queue/add") == 2
@@ -300,7 +305,7 @@ def test_a_stop_while_waiting_for_the_delivery_lock_ends_the_waiter_and_its_app_
     thread = _run_waiter(tmp_path / "db", stop)
     try:
         wait_for(lambda: store.pending(receiver["id"]) is None)
-        assert codex.texts("thread-1") == [f"{message_id} room plan\nhello"]
+        assert codex.texts("thread-1") == [queued(message_id, "hello")]
         assert codex.requests().count("thread/queue/add") == 1
     finally:
         stop.set()
@@ -349,7 +354,7 @@ def test_the_lock_wait_stops_without_a_mark(tmp_path, monkeypatch):
     threading.Timer(0.3, stop.set).start()
     try:
         with pytest.raises(SinkTransportError, match="stopped before the delivery lock"):
-            deliver_to_codex(store, sink, "thread-1", message, render_message(message), "tok")
+            deliver_to_codex(store, sink, "thread-1", message, render_codex(message), "tok")
     finally:
         sink.close()
         holder.kill()
@@ -426,7 +431,7 @@ def test_a_waiter_taken_over_after_reading_the_message_hands_nothing_over(tmp_pa
     thread.start()
     try:
         wait_for(lambda: store.pending(receiver["id"]) is None)
-        assert codex.texts("thread-2") == [f"{message_id} room plan\nhello"]
+        assert codex.texts("thread-2") == [queued(message_id, "hello")]
         assert codex.requests().count("thread/queue/add") == 1
     finally:
         stop.set()
@@ -442,7 +447,7 @@ def test_the_delivery_refuses_a_message_whose_recipient_is_owned_elsewhere(tmp_p
     sink = CodexSink(timeout=5)
     try:
         with pytest.raises(DeliveryNotOwned):
-            deliver_to_codex(store, sink, "thread-1", message, render_message(message), "tok")
+            deliver_to_codex(store, sink, "thread-1", message, render_codex(message), "tok")
     finally:
         sink.close()
     assert codex.requests().count("thread/queue/add") == 0
@@ -471,9 +476,41 @@ def test_a_key_held_by_other_text_is_a_conflict_that_is_reported_once_and_never_
         later = store.send(store.participant("room", "plan")["id"], "after", to="exec")[0]["message_id"]
         wait_for(lambda: store.pending(receiver["id"]) is not None and store.pending(receiver["id"])["id"] == message_id
                  and len(codex.texts("thread-1")) == 2)
-        assert codex.texts("thread-1") == ["something else", f"{later} room plan\nafter"]
+        assert codex.texts("thread-1") == ["something else", queued(later, "after")]
         time.sleep(0.5)
         assert codex.requests().count("thread/queue/add") == 2                # never added
+        assert store.pending(receiver["id"])["id"] == message_id            # never acknowledged
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+        store.close()
+
+
+def test_a_message_queued_before_the_reply_line_is_a_conflict_after_the_upgrade(tmp_path, monkeypatch):
+    """A waiter from before the reply line queued a message and stopped before acknowledging
+    it, so the text under its key is the form without the line. The upgraded waiter finds
+    other text there: the queued original stays as it was, nothing is added again or
+    acknowledged, and later messages go on."""
+    codex = FakeCodex(tmp_path / "bin").apply(monkeypatch)
+    store, receiver, message_id = _store_with_message(tmp_path / "db")
+    message = store.pending_for_token("tok")
+    key = f"agent-channel:{store.channel_id}:{message_id}"
+    sink = CodexSink(timeout=5)
+    sink.add("thread-1", key, render_message(message))
+    sink.close()
+    store.mark_attempted(message_id, "tok")
+    stop = threading.Event()
+    thread = _run_waiter(tmp_path / "db", stop)
+    try:
+        run = wait_for(lambda: (
+            (run := store.last_waiter(receiver["id"], "tok")) and run["last_error"] and run
+        ))
+        assert run["last_error"].startswith(f"key conflict for message {message_id}: key {key} was ")
+        later = store.send(store.participant("room", "plan")["id"], "after", to="exec")[0]["message_id"]
+        wait_for(lambda: len(codex.texts("thread-1")) == 2)
+        assert codex.texts("thread-1") == [render_message(message), queued(later, "after")]
+        time.sleep(0.5)
+        assert codex.requests().count("thread/queue/add") == 2                # never added again
         assert store.pending(receiver["id"])["id"] == message_id            # never acknowledged
     finally:
         stop.set()
@@ -500,7 +537,7 @@ def test_an_app_server_without_the_queue_api_delivers_nothing_and_says_so(tmp_pa
         assert store.pending(receiver["id"])["id"] == message_id
         codex.set(unsupported=None)                                          # a capable app-server appears
         wait_for(lambda: store.pending(receiver["id"]) is None)
-        assert codex.texts("thread-1") == [f"{message_id} room plan\nhello"]
+        assert codex.texts("thread-1") == [queued(message_id, "hello")]
     finally:
         stop.set()
         thread.join(timeout=5)
@@ -525,7 +562,7 @@ def test_two_waiters_delivering_the_same_message_add_it_once(tmp_path, monkeypat
     store, receiver, message_id = _store_with_message(tmp_path / "db")
     message = store.pending_for_token("tok")
     assert message["attempted"] == 0
-    text = render_message(message)
+    text = render_codex(message)
 
     def deliver(_):
         own = Store(tmp_path / "db")

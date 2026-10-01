@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agent_channel_mcp import waiter as waiter_module          # noqa: E402
 from agent_channel_mcp.codex_sink import CodexSink, KeyConflict  # noqa: E402
 from agent_channel_mcp.store import Store                       # noqa: E402
-from agent_channel_mcp.waiter import DeliveryUncertain, WaiterSignal, deliver_to_codex, render_message  # noqa: E402
+from agent_channel_mcp.waiter import DeliveryUncertain, WaiterSignal, deliver_to_codex, render_codex  # noqa: E402
 
 requests_seen: list[dict] = []
 
@@ -158,7 +158,7 @@ class Scenario:
         self.store.activate(self.receiver["id"], "tok")
         self.message_id = self.store.send(sender["id"], f"message for {name}", to="exec")[0]["message_id"]
         self.message = self.store.pending_for_token("tok")
-        self.text = render_message(self.message)
+        self.text = render_codex(self.message)
         self.key = f"agent-channel:{self.store.channel_id}:{self.message_id}"
         self.requests_before = len(requests_seen)
 

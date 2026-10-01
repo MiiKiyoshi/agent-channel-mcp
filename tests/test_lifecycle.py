@@ -287,7 +287,8 @@ def test_a_hung_app_server_is_cut_off_and_the_same_message_is_delivered_later(
         assert codex.texts("thread-1") == []                          # nothing got through
         codex.set(hang=None)                                          # the app-server answers again
         wait_for(lambda: store.pending(receiver["id"]) is None, timeout=12)
-        assert codex.texts("thread-1") == [f"{message_id} room plan\nslow lane"]
+        assert codex.texts("thread-1") == [waiter_module.render_codex(
+            {"id": message_id, "room": "room", "sender": "plan", "text": "slow lane"})]
     finally:
         store.deactivate(token)
         thread.join(timeout=5)
