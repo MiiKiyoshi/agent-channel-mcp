@@ -270,6 +270,24 @@ def _stop_waiter(process: subprocess.Popen, store: Store, token: str):
         process.stderr.close()
 
 
+def test_a_waiter_whose_connection_closed_says_to_join_again(tmp_path):
+    """A waiter is re-armed by running the same command again, without join. Once the
+    connection behind it has closed, that command can only end, and it says so where the
+    agent reads, so the agent joins again instead of believing a waiter runs."""
+    db = tmp_path / "channel.sqlite3"
+    store = Store(db)
+    receiver = store.participant("room", "receiver")
+    token = "session-token"
+    _active(store, receiver, token)
+    store.deactivate(token)
+    try:
+        ended = subprocess.run(_waiter_command(db, token), capture_output=True, text=True, timeout=10)
+    finally:
+        store.close()
+    assert ended.returncode == 0, ended.stderr
+    assert ended.stdout == "The waiter ended because this connection closed. Call join again and follow its result.\n"
+
+
 def test_waiter_delivers_text_and_acks_after_stdout_success(tmp_path):
     db = tmp_path / "channel.sqlite3"
     store = Store(db)

@@ -329,6 +329,12 @@ def run(db: Path, token: str, codex_thread: str | None = None,
                 raise
             else:
                 why = "stopped by the server" if stop.is_set() else "token inactive"
+                if not stop.is_set():
+                    # A re-arm runs this same command without join, and once the connection
+                    # behind it has closed the command can only end. Said on stdout, the one
+                    # place the agent reads, it joins again rather than believing a waiter runs.
+                    print("The waiter ended because this connection closed. Call join again "
+                          "and follow its result.", flush=True)
                 try:
                     store.waiter_finished(token, "normal", 0, why)
                 except sqlite3.OperationalError as error:

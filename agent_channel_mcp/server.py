@@ -283,9 +283,12 @@ class Channel:
         command = "sh " + shlex.quote(str(self.script))
         name = client_name.casefold()
         if "claude" in name:
-            how = ("Monitor(command=<command>, timeout_ms=1800000); then end the turn. A Monitor "
-                   "expires after 30 minutes and ends the waiter: on each expiry notice, call join "
-                   "again and follow its result.")
+            # Re-arming costs a model turn, and each request in it carries the whole
+            # conversation. The same command needs no join first, so a re-arm is one call.
+            how = ("Monitor(command=<command>, timeout_ms=1800000), then end the turn. A Monitor "
+                   "ends after 30 minutes: on each expiry notice, start the same Monitor again and "
+                   "end the turn without a reply. Call join again only when the waiter says its "
+                   "connection closed.")
         elif "codex" in name:
             self._start_supervisor(self.token)
             command += ' --register --codex "${CODEX_THREAD_ID:?CODEX_THREAD_ID is required}"'
