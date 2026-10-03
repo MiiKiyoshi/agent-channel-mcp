@@ -284,11 +284,16 @@ class Channel:
         name = client_name.casefold()
         if "claude" in name:
             # Re-arming costs a model turn, and each request in it carries the whole
-            # conversation. The same command needs no join first, so a re-arm is one call.
-            how = ("Monitor(command=<command>, timeout_ms=1800000), then end the turn. A Monitor "
-                   "ends after 30 minutes: on each expiry notice, start the same Monitor again and "
-                   "end the turn without a reply. Call join again only when the waiter says its "
-                   "connection closed.")
+            # conversation, so it happens only while a joined room still needs messages.
+            # The same command needs no join first, so a re-arm is one call.
+            how = ("Use Monitor(command=<command>, timeout_ms=1800000) while any joined room is "
+                   "needed for your work, then end the turn. On a 30-minute expiry notice, check the "
+                   "ongoing work in every joined room. If any still needs messages, restart the same "
+                   "Monitor and end the turn without a reply. Otherwise leave it stopped and end the "
+                   "turn without a reply. Stop an active Monitor when no joined room needs messages. "
+                   "Judge from the work, not message inactivity or an explicit stop request. Rejoin "
+                   "after a new MCP connection or restart, or when the waiter reports a closed "
+                   "connection.")
         elif "codex" in name:
             self._start_supervisor(self.token)
             command += ' --register --codex "${CODEX_THREAD_ID:?CODEX_THREAD_ID is required}"'
@@ -447,9 +452,11 @@ class Channel:
 
 def create_server(channel: Channel) -> FastMCP:
     mcp = FastMCP("agent-channel-mcp", instructions=
-    "Use only across different session systems; same-system sessions use native communication. "
-    "On each new MCP connection or restart, join each room again. If waiter=offline, start command using how; "
-    "if active, do nothing. Do not poll or start duplicate waiters. "
+    "Use only across different session systems. Use native communication within one system. "
+    "On each new MCP connection or restart, rejoin rooms needed for your work. "
+    "If waiter=offline and any joined room needs messages, follow how. "
+    "Keep one waiter for those rooms and stop it when none needs messages. "
+    "Do not poll or duplicate waiters. "
     "If you were invited, contact the participant named in the invitation first and exchange the context "
     "the room's purpose needs. Joining assigns no work or authority. "
     "Delivery starts with 'id room sender', plus 'k/n' for a part of a long one. Deduplicate by id and part. "

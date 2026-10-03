@@ -112,8 +112,11 @@ def test_join_returns_waiter_command_and_old_token_is_invalidated(tmp_path):
             "reason": "not started for this connection"
         }
         assert "Monitor(" in result["how"]
-        assert "on each expiry notice, start the same Monitor again" in result["how"]
-        assert "Call join again only when the waiter says its connection closed" in result["how"]
+        # A re-arm follows the work in the joined rooms, not every expiry.
+        assert "check the ongoing work in every joined room" in result["how"]
+        assert "If any still needs messages, restart the same Monitor" in result["how"]
+        assert "Otherwise leave it stopped" in result["how"]
+        assert "or when the waiter reports a closed connection" in result["how"]
         assert Path(shlex.split(result["command"])[1]).exists()
         assert first.join("room", "claude", "claude-code") == result
         first.store.waiter_started(identity["id"], first.token, 12345)
@@ -278,7 +281,8 @@ def test_instructions_lead_from_join_to_waiter_command(tmp_path):
         descriptions = {tool.name: tool.description for tool in asyncio.run(server.list_tools())}
         join = " ".join(descriptions["join"].split())  # docstring line breaks are not part of the text
         assert "only across different session systems" in instructions
-        assert "same-system sessions use native communication" in instructions
+        assert "Use native communication within one system" in instructions
+        assert "stop it when none needs messages" in instructions
         assert "Join or create a room; call again to add rooms" in join
         assert "Create one only when asked, with a descriptive name" in join
         assert "short, distinct, no whitespace, for this room only" in join
@@ -290,8 +294,8 @@ def test_instructions_lead_from_join_to_waiter_command(tmp_path):
         assert "Do not start the invited session" in join
         assert "command/how only while waiter is offline" in join
         assert len(join) <= 500
-        assert "waiter=offline, start command using how" in instructions
-        assert "Do not poll or start duplicate waiters" in instructions
+        assert "If waiter=offline and any joined room needs messages, follow how" in instructions
+        assert "Do not poll or duplicate waiters" in instructions
         assert "Do not poll" in instructions
         # The invited side contacts the named participant, and joining grants nothing by itself.
         assert "contact the participant named in the invitation first" in instructions
@@ -333,7 +337,7 @@ def test_two_stdio_clients_and_generated_waiter(tmp_path):
         async with stdio_client(params) as (ar, aw), stdio_client(params) as (br, bw):
             async with ClientSession(ar, aw, client_info=Implementation(name="claude-code", version="test")) as a, \
                     ClientSession(br, bw, client_info=Implementation(name="codex", version="test")) as b:
-                assert "waiter=offline, start command using how" in (await a.initialize()).instructions
+                assert "If waiter=offline and any joined room needs messages, follow how" in (await a.initialize()).instructions
                 await b.initialize()
                 assert {tool.name for tool in (await a.list_tools()).tools} == {
                     "join", "send", "rename", "leave",
