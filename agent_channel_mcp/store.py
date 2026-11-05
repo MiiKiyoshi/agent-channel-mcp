@@ -408,6 +408,11 @@ class Store:
                     "SELECT id, name FROM participants WHERE room=? AND id<>? "
                     "AND left_at IS NULL ORDER BY name", (sender["room"], sender_id)
                 ).fetchall()
+                if not recipients:
+                    raise ValueError(
+                        "No one else is in this room, so nothing was sent; "
+                        "a peer invited to it writes first once it joins"
+                    )
             else:
                 recipients = self.db.execute(
                     "SELECT id, name FROM participants WHERE room=? AND name=? "

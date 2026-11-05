@@ -291,6 +291,8 @@ def test_instructions_lead_from_join_to_waiter_command(tmp_path):
         assert "whom to contact first" in join
         assert 'join(room="...", name="<peer>")' in join
         assert "No work detail" in join
+        # A room just created holds no one to receive a message.
+        assert "A room's creator sends nothing before that contact" in instructions
         assert "Do not start the invited session" in join
         assert "command/how only while waiter is offline" in join
         assert len(join) <= 500

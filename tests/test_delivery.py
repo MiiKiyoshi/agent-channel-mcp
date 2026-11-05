@@ -88,6 +88,14 @@ def test_send_rejects_unknown_recipient_and_cross_room_target(tmp_path):
     store.close()
 
 
+def test_broadcast_to_an_empty_room_is_refused(tmp_path):
+    store = make_store(tmp_path)
+    plan = store.participant("room", "plan")
+    with pytest.raises(ValueError, match="No one else is in this room"):
+        store.send(plan["id"], "hello")
+    store.close()
+
+
 def test_broadcast_targets_every_other_registered_participant(tmp_path):
     store = make_store(tmp_path)
     plan = store.participant("room", "plan")
