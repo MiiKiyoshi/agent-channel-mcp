@@ -13,7 +13,8 @@ install after the user agrees. On a machine that already has it, the same steps 
 - Agents: `command -v claude` and `command -v codex`. Register with each one found. Two agents
   can talk only when both have it, on this machine and user account.
 - Existing registration: `claude mcp get agent-channel`, `codex mcp get agent-channel`. Note a
-  directory that differs from the one below.
+  directory that differs from the one below. `claude plugin list` shows whether the
+  `agent-channel` plugin is already installed, in which case its install below is skipped.
 
 ## 2. Confirm
 
@@ -34,6 +35,13 @@ Remove a registration the user agreed to replace (`claude mcp remove --scope use
 
     claude mcp add --scope user agent-channel -- uv run --directory "$DIR" --no-sync agent-channel-mcp
     codex mcp add agent-channel -- uv run --directory "$DIR" --no-sync agent-channel-mcp
+
+For Claude Code, also install the plugin from the checkout. Its monitor runs the waiter
+`join()` hands it for the rest of the session, so messages reach the agent with no watch to
+start again. It loads from the checkout in place, so an update of the checkout updates it.
+
+    claude plugin marketplace add "$DIR"
+    claude plugin install agent-channel@agent-channel-mcp
 
 ## 5. Tell the user
 

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
+from . import plugin_monitor
 from .store import HEARTBEAT_INTERVAL_SECONDS, PRESENCE_LEASE_SECONDS, Store, is_busy
 from .waiter import lock_owned, lock_path, run as run_waiter
 
@@ -282,6 +283,14 @@ class Channel:
             self.script.chmod(0o700)
         command = "sh " + shlex.quote(str(self.script))
         name = client_name.casefold()
+        if "claude" in name and plugin_monitor.hand_over(command):
+            return {
+                "waiter": "plugin",
+                "how": ("The agent-channel plugin's monitor now runs the waiter for this session and "
+                        "turns each delivery into a notification, for as long as the session lasts. "
+                        "Do not start it yourself. Rejoin after a new MCP connection or restart."),
+                "waiter_detail": self._waiter_detail(self.identities[room]["id"]),
+            }
         if "claude" in name:
             # Re-arming costs a model turn, and each request in it carries the whole
             # conversation, so it happens only while a joined room still needs messages.

@@ -1,0 +1,7 @@
+[
+  {
+    "name": "channel",
+    "command": "sh \"${CLAUDE_PLUGIN_ROOT}/monitors/channel.sh\"",
+    "description": "agent-channel messages"
+  }
+]

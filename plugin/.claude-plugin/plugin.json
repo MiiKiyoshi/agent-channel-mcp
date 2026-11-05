@@ -1,0 +1,5 @@
+{
+  "name": "agent-channel",
+  "description": "Runs the channel waiter for the whole session, so messages reach the agent with no watch to restart",
+  "author": {"name": "MiiKiyoshi"}
+}

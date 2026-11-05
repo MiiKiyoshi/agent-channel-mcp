@@ -372,3 +372,42 @@ def test_an_earlier_run_in_the_same_second_is_not_taken_for_this_attempt(tmp_pat
     assert channel.worker is not None                                # tried again instead
     wait_for(lambda: store.latest_run_id(token) > runs_before)       # and this one ran
     channel.close()
+
+
+def test_join_hands_the_waiter_to_the_plugin_monitor(tmp_path, monkeypatch):
+    """In a session the plugin's monitor serves, join() hands it the waiter and tells the agent
+    not to start one, and a message to the joined role comes out of the monitor."""
+    from agent_channel_mcp import plugin_monitor
+
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(plugin_monitor, "DIRECTORY", cache / "agent-channel-mcp" / "monitor")
+    session = subprocess.Popen(["sleep", "60"])
+    monkeypatch.setattr(plugin_monitor, "claude_pid", lambda: session.pid)
+    monitor = subprocess.Popen(
+        ["sh", str(Path(__file__).parents[1] / "plugin" / "monitors" / "channel.sh"), str(session.pid)],
+        stdout=subprocess.PIPE, text=True, env={**os.environ, "XDG_CACHE_HOME": str(cache)})
+    channel = Channel(tmp_path / "db")
+    peer = Channel(tmp_path / "db")
+    try:
+        record = plugin_monitor.DIRECTORY / f"{session.pid}.monitor"
+        wait_for(record.exists)
+        joined = channel.join("room", "exec", "claude-code")
+        assert joined["waiter"] == "plugin" and "Monitor(" not in joined["how"]
+        assert "command" not in joined
+        peer.join("room", "plan", "other")
+        wait_for(lambda: any(status["name"] == "exec" and status["waiter"] == "active"
+                             for status in channel.store.role_statuses("room")))
+        peer.send("hello from plan", to="exec")
+        assert "hello from plan" in monitor.stdout.readline() + monitor.stdout.readline()
+        # The session ending ends the monitor, its waiter, and its record.
+        session.kill()
+        session.wait()
+        monitor.wait(timeout=10)
+        assert not record.exists()
+    finally:
+        for process in (session, monitor):
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+        channel.close()
+        peer.close()
